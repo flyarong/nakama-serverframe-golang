@@ -22,15 +22,13 @@ package nakama.api;
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
 
-option go_package = "api";
+option go_package = "github.com/heroiclabs/nakama-common/api";
 
 option java_multiple_files = true;
 option java_outer_classname = "NakamaApi";
 option java_package = "com.heroiclabs.nakama.api";
 
-option csharp_namespace = "Nakama";
-
-option objc_class_prefix = "NKPB";
+option csharp_namespace = "Nakama.Protobuf";
 
 // A user with additional account details. Always the current user.
 message Account {
@@ -46,6 +44,24 @@ message Account {
   string custom_id = 5;
   // The UNIX time when the user's email was verified.
   google.protobuf.Timestamp verify_time = 6;
+  // The UNIX time when the user's account was disabled/banned.
+  google.protobuf.Timestamp disable_time = 7;
+}
+
+// Obtain a new authentication token using a refresh token.
+message AccountRefresh {
+  // Refresh token.
+  string token = 1;
+  // Extra information that will be bundled in the session token.
+  map<string, string> vars = 2;
+}
+
+// Send a Apple Sign In token to the server. Used with authenticate/link/unlink.
+message AccountApple {
+  // The ID token received from Apple to validate.
+  string token = 1;
+  // Extra information that will be bundled in the session token.
+  map<string, string> vars = 2;
 }
 
 // Send a custom ID to the server. Used with authenticate/link/unlink.
@@ -78,6 +94,14 @@ message AccountEmail {
 message AccountFacebook {
   // The OAuth token received from Facebook to access their profile API.
   string token = 1;
+  // Extra information that will be bundled in the session token.
+  map<string, string> vars = 2;
+}
+
+// Send a Facebook Instant Game token to the server. Used with authenticate/link/unlink.
+message AccountFacebookInstantGame {
+  // The OAuth token received from a Facebook Instant Game that may be decoded with the Application Secret (must be available with the nakama configuration)
+  string signed_player_info = 1;
   // Extra information that will be bundled in the session token.
   map<string, string> vars = 2;
 }
@@ -134,6 +158,24 @@ message AddGroupUsersRequest {
   repeated string user_ids = 2;
 }
 
+// Authenticate against the server with a refresh token.
+message SessionRefreshRequest {
+  // Refresh token.
+  string token = 1;
+  // Extra information that will be bundled in the session token.
+  map<string, string> vars = 2;
+}
+
+// Authenticate against the server with Apple Sign In.
+message AuthenticateAppleRequest {
+  // The Apple account details.
+  AccountApple account = 1;
+  // Register the account if the user does not already exist.
+  google.protobuf.BoolValue create = 2;
+  // Set the username on the account at register. Must be unique.
+  string username = 3;
+}
+
 // Authenticate against the server with a custom ID.
 message AuthenticateCustomRequest {
   // The custom account details.
@@ -176,6 +218,16 @@ message AuthenticateFacebookRequest {
   google.protobuf.BoolValue sync = 4;
 }
 
+// Authenticate against the server with Facebook Instant Game token.
+message AuthenticateFacebookInstantGameRequest {
+  // The Facebook Instant Game account details.
+  AccountFacebookInstantGame account = 1;
+  // Register the account if the user does not already exist.
+  google.protobuf.BoolValue create = 2;
+  // Set the username on the account at register. Must be unique.
+  string username = 3;
+}
+
 // Authenticate against the server with Apple's Game Center.
 message AuthenticateGameCenterRequest {
   // The Game Center account details.
@@ -204,6 +256,8 @@ message AuthenticateSteamRequest {
   google.protobuf.BoolValue create = 2;
   // Set the username on the account at register. Must be unique.
   string username = 3;
+  // Import Steam friends for the user.
+  google.protobuf.BoolValue sync = 4;
 }
 
 // Ban users from a group.
@@ -256,10 +310,12 @@ message ChannelMessage {
 message ChannelMessageList {
   // A list of messages.
   repeated ChannelMessage messages = 1;
-  // The cursor to send when retireving the next page, if any.
+  // The cursor to send when retrieving the next page, if any.
   string next_cursor = 2;
   // The cursor to send when retrieving the previous page, if any.
   string prev_cursor = 3;
+  // Cacheable cursor to list newer messages. Durable and designed to be stored, unlike next/prev cursors.
+  string cacheable_cursor = 4;
 }
 
 // Create a group with the current user as owner.
@@ -350,6 +406,8 @@ message Friend {
   User user = 1;
   // The friend status.
   google.protobuf.Int32Value state = 2; // one of "Friend.State".
+  // Time of the latest relationship update.
+  google.protobuf.Timestamp update_time = 3;
 }
 
 // A collection of zero or more friends of the user.
@@ -442,6 +500,14 @@ message ImportFacebookFriendsRequest {
   google.protobuf.BoolValue reset = 2;
 }
 
+// Import Facebook friends into the current user's account.
+message ImportSteamFriendsRequest {
+  // The Facebook account details.
+  AccountSteam account = 1;
+  // Reset the current user's friends list.
+  google.protobuf.BoolValue reset = 2;
+}
+
 // Immediately join an open group, or request to join a closed one.
 message JoinGroupRequest {
   // The group ID to join. The group must already exist.
@@ -513,7 +579,15 @@ message LinkFacebookRequest {
   // The Facebook account details.
   AccountFacebook account = 1;
   // Import Facebook friends for the user.
-  google.protobuf.BoolValue sync = 4;
+  google.protobuf.BoolValue sync = 2;
+}
+
+// Link Steam to the current user's account.
+message LinkSteamRequest {
+  // The Facebook account details.
+  AccountSteam account = 1;
+  // Import Steam friends for the user.
+  google.protobuf.BoolValue sync = 2;
 }
 
 // List a channel's message history.
@@ -686,6 +760,10 @@ message Match {
   google.protobuf.StringValue label = 3;
   // Current number of users in the match.
   int32 size = 4;
+  // Tick Rate
+  int32 tick_rate = 5;
+  // Handler name
+  string handler_name = 6;
 }
 
 // A list of realtime matches.
@@ -728,6 +806,14 @@ message PromoteGroupUsersRequest {
   repeated string user_ids = 2;
 }
 
+// Demote a set of users in a group to the next role down.
+message DemoteGroupUsersRequest {
+  // The group ID to demote in.
+  string group_id = 1;
+  // The users to demote.
+  repeated string user_ids = 2;
+}
+
 // Storage objects to get.
 message ReadStorageObjectId {
   // The collection which stores the object.
@@ -760,6 +846,8 @@ message Session {
   bool created = 1;
   // Authentication credentials.
   string token = 2;
+  // Refresh token that can be used for session token renewal.
+  string refresh_token = 3;
 }
 
 // An object within the storage engine.
@@ -940,6 +1028,10 @@ message User {
   google.protobuf.Timestamp create_time = 15;
   // The UNIX time when the user was last updated.
   google.protobuf.Timestamp update_time = 16;
+  // The Facebook Instant Game ID in the user's account.
+  string facebook_instant_game_id = 17;
+  // The Apple Sign In ID in the user's account.
+  string apple_id = 18;
 }
 
 // A list of groups belonging to a user, along with the user's role in each group.

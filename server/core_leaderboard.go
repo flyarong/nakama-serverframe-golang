@@ -71,7 +71,7 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 		limitNumber := int(limit.Value)
 		var incomingCursor *leaderboardRecordListCursor
 		if cursor != "" {
-			cb, err := base64.StdEncoding.DecodeString(cursor)
+			cb, err := base64.URLEncoding.DecodeString(cursor)
 			if err != nil {
 				return nil, ErrLeaderboardInvalidCursor
 			}
@@ -221,7 +221,7 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 				logger.Error("Error creating leaderboard records list next cursor", zap.Error(err))
 				return nil, err
 			}
-			nextCursorStr = base64.StdEncoding.EncodeToString(cursorBuf.Bytes())
+			nextCursorStr = base64.URLEncoding.EncodeToString(cursorBuf.Bytes())
 		}
 		if prevCursor != nil {
 			cursorBuf := new(bytes.Buffer)
@@ -229,7 +229,7 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 				logger.Error("Error creating leaderboard records list previous cursor", zap.Error(err))
 				return nil, err
 			}
-			prevCursorStr = base64.StdEncoding.EncodeToString(cursorBuf.Bytes())
+			prevCursorStr = base64.URLEncoding.EncodeToString(cursorBuf.Bytes())
 		}
 	}
 
@@ -263,7 +263,7 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 		for rows.Next() {
 			err = rows.Scan(&dbOwnerID, &dbUsername, &dbScore, &dbSubscore, &dbNumScore, &dbMaxNumScore, &dbMetadata, &dbCreateTime, &dbUpdateTime)
 			if err != nil {
-				_ = rows.Close()
+				rows.Close()
 				logger.Error("Error parsing read leaderboard records", zap.Error(err))
 				return nil, err
 			}
@@ -327,12 +327,14 @@ func LeaderboardRecordWrite(ctx context.Context, logger *zap.Logger, db *sql.DB,
 	switch leaderboard.Operator {
 	case LeaderboardOperatorIncrement:
 		opSQL = "score = leaderboard_record.score + $8, subscore = leaderboard_record.subscore + $9"
+		filterSQL = " WHERE $8 <> 0 OR $9 <> 0"
 		scoreDelta = score
 		subscoreDelta = subscore
 		scoreAbs = score
 		subscoreAbs = subscore
 	case LeaderboardOperatorSet:
 		opSQL = "score = $8, subscore = $9"
+		filterSQL = " WHERE leaderboard_record.score <> $8 OR leaderboard_record.subscore <> $9"
 		scoreDelta = score
 		subscoreDelta = subscore
 		scoreAbs = score
@@ -358,7 +360,7 @@ func LeaderboardRecordWrite(ctx context.Context, logger *zap.Logger, db *sql.DB,
 	query := `INSERT INTO leaderboard_record (leaderboard_id, owner_id, username, score, subscore, metadata, expiry_time)
             VALUES ($1, $2, $3, $4, $5, COALESCE($6, '{}'::JSONB), $7)
             ON CONFLICT (owner_id, leaderboard_id, expiry_time)
-            DO UPDATE SET ` + opSQL + `, num_score = leaderboard_record.num_score + 1, metadata = COALESCE($6, leaderboard_record.metadata), update_time = now()` + filterSQL
+            DO UPDATE SET ` + opSQL + `, num_score = leaderboard_record.num_score + 1, metadata = COALESCE($6, leaderboard_record.metadata), username = COALESCE($3, leaderboard_record.username), update_time = now()` + filterSQL
 	params := make([]interface{}, 0, 9)
 	params = append(params, leaderboardId, ownerID)
 	if username == "" {
@@ -423,7 +425,7 @@ func LeaderboardRecordWrite(ctx context.Context, logger *zap.Logger, db *sql.DB,
 func LeaderboardRecordDelete(ctx context.Context, logger *zap.Logger, db *sql.DB, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, caller uuid.UUID, leaderboardId, ownerID string) error {
 	leaderboard := leaderboardCache.Get(leaderboardId)
 	if leaderboard == nil {
-		return nil
+		return ErrLeaderboardNotFound
 	}
 
 	if leaderboard.Authoritative && caller != uuid.Nil {

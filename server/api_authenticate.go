@@ -54,6 +54,71 @@ func (stc *SessionTokenClaims) Valid() error {
 	return nil
 }
 
+func (s *ApiServer) AuthenticateApple(ctx context.Context, in *api.AuthenticateAppleRequest) (*api.Session, error) {
+	// Before hook.
+	if fn := s.runtime.BeforeAuthenticateApple(); fn != nil {
+		beforeFn := func(clientIP, clientPort string) error {
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
+			if err != nil {
+				return status.Error(code, err.Error())
+			}
+			if result == nil {
+				// If result is nil, requested resource is disabled.
+				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)))
+				return status.Error(codes.NotFound, "Requested resource was not found.")
+			}
+			in = result
+			return nil
+		}
+
+		// Execute the before function lambda wrapped in a trace for stats measurement.
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if s.config.GetSocial().Apple.BundleId == "" {
+		return nil, status.Error(codes.FailedPrecondition, "Apple authentication is not configured.")
+	}
+
+	if in.Account == nil || in.Account.Token == "" {
+		return nil, status.Error(codes.InvalidArgument, "Apple ID token is required.")
+	}
+
+	username := in.Username
+	if username == "" {
+		username = generateUsername()
+	} else if invalidCharsRegex.MatchString(username) {
+		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
+	} else if len(username) > 128 {
+		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
+	}
+
+	create := in.Create == nil || in.Create.Value
+
+	dbUserID, dbUsername, created, err := AuthenticateApple(ctx, s.logger, s.db, s.socialClient, s.config.GetSocial().Apple.BundleId, in.Account.Token, username, create)
+	if err != nil {
+		return nil, err
+	}
+
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, _ := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
+
+	// After hook.
+	if fn := s.runtime.AfterAuthenticateApple(); fn != nil {
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		}
+
+		// Execute the after function lambda wrapped in a trace for stats measurement.
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+	}
+
+	return session, nil
+}
+
 func (s *ApiServer) AuthenticateCustom(ctx context.Context, in *api.AuthenticateCustomRequest) (*api.Session, error) {
 	// Before hook.
 	if fn := s.runtime.BeforeAuthenticateCustom(); fn != nil {
@@ -72,7 +137,7 @@ func (s *ApiServer) AuthenticateCustom(ctx context.Context, in *api.Authenticate
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -103,16 +168,17 @@ func (s *ApiServer) AuthenticateCustom(ctx context.Context, in *api.Authenticate
 	}
 
 	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
-	session := &api.Session{Created: created, Token: token}
+	refreshToken, _ := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateCustom(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -136,7 +202,7 @@ func (s *ApiServer) AuthenticateDevice(ctx context.Context, in *api.Authenticate
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -167,16 +233,17 @@ func (s *ApiServer) AuthenticateDevice(ctx context.Context, in *api.Authenticate
 	}
 
 	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
-	session := &api.Session{Created: created, Token: token}
+	refreshToken, _ := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateDevice(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -200,7 +267,7 @@ func (s *ApiServer) AuthenticateEmail(ctx context.Context, in *api.AuthenticateE
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -261,16 +328,17 @@ func (s *ApiServer) AuthenticateEmail(ctx context.Context, in *api.AuthenticateE
 	}
 
 	token, exp := generateToken(s.config, dbUserID, username, in.Account.Vars)
-	session := &api.Session{Created: created, Token: token}
+	refreshToken, _ := generateRefreshToken(s.config, dbUserID, username, in.Account.Vars)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateEmail(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, username, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, username, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -294,7 +362,7 @@ func (s *ApiServer) AuthenticateFacebook(ctx context.Context, in *api.Authentica
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -321,21 +389,82 @@ func (s *ApiServer) AuthenticateFacebook(ctx context.Context, in *api.Authentica
 	}
 
 	// Import friends if requested.
-	if in.Sync == nil || in.Sync.Value {
-		importFacebookFriends(ctx, s.logger, s.db, s.router, s.socialClient, uuid.FromStringOrNil(dbUserID), dbUsername, in.Account.Token, false)
+	if in.Sync != nil && in.Sync.Value {
+		_ = importFacebookFriends(ctx, s.logger, s.db, s.router, s.socialClient, uuid.FromStringOrNil(dbUserID), dbUsername, in.Account.Token, false)
 	}
 
 	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
-	session := &api.Session{Created: created, Token: token}
+	refreshToken, _ := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateFacebook(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+	}
+
+	return session, nil
+}
+
+func (s *ApiServer) AuthenticateFacebookInstantGame(ctx context.Context, in *api.AuthenticateFacebookInstantGameRequest) (*api.Session, error) {
+	// Before hook.
+	if fn := s.runtime.BeforeAuthenticateFacebookInstantGame(); fn != nil {
+		beforeFn := func(clientIP, clientPort string) error {
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
+			if err != nil {
+				return status.Error(code, err.Error())
+			}
+			if result == nil {
+				// If result is nil, requested resource is disabled.
+				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)))
+				return status.Error(codes.NotFound, "Requested resource was not found.")
+			}
+			in = result
+			return nil
+		}
+
+		// Execute the before function lambda wrapped in a trace for stats measurement.
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if in.Account == nil || in.Account.SignedPlayerInfo == "" {
+		return nil, status.Error(codes.InvalidArgument, "Signed Player Info for a Facebook Instant Game is required.")
+	}
+
+	username := in.Username
+	if username == "" {
+		username = generateUsername()
+	} else if invalidCharsRegex.MatchString(username) {
+		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
+	} else if len(username) > 128 {
+		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
+	}
+
+	create := in.Create == nil || in.Create.Value
+
+	dbUserID, dbUsername, created, err := AuthenticateFacebookInstantGame(ctx, s.logger, s.db, s.socialClient, s.config.GetSocial().FacebookInstantGame.AppSecret, in.Account.SignedPlayerInfo, username, create)
+	if err != nil {
+		return nil, err
+	}
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, _ := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
+
+	// After hook.
+	if fn := s.runtime.AfterAuthenticateFacebookInstantGame(); fn != nil {
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		}
+
+		// Execute the after function lambda wrapped in a trace for stats measurement.
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -359,7 +488,7 @@ func (s *ApiServer) AuthenticateGameCenter(ctx context.Context, in *api.Authenti
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -398,16 +527,17 @@ func (s *ApiServer) AuthenticateGameCenter(ctx context.Context, in *api.Authenti
 	}
 
 	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
-	session := &api.Session{Created: created, Token: token}
+	refreshToken, _ := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateGameCenter(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -431,7 +561,7 @@ func (s *ApiServer) AuthenticateGoogle(ctx context.Context, in *api.Authenticate
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -458,16 +588,17 @@ func (s *ApiServer) AuthenticateGoogle(ctx context.Context, in *api.Authenticate
 	}
 
 	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
-	session := &api.Session{Created: created, Token: token}
+	refreshToken, _ := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateGoogle(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -491,7 +622,7 @@ func (s *ApiServer) AuthenticateSteam(ctx context.Context, in *api.AuthenticateS
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -516,22 +647,28 @@ func (s *ApiServer) AuthenticateSteam(ctx context.Context, in *api.AuthenticateS
 
 	create := in.Create == nil || in.Create.Value
 
-	dbUserID, dbUsername, created, err := AuthenticateSteam(ctx, s.logger, s.db, s.socialClient, s.config.GetSocial().Steam.AppID, s.config.GetSocial().Steam.PublisherKey, in.Account.Token, username, create)
+	dbUserID, dbUsername, steamID, created, err := AuthenticateSteam(ctx, s.logger, s.db, s.socialClient, s.config.GetSocial().Steam.AppID, s.config.GetSocial().Steam.PublisherKey, in.Account.Token, username, create)
 	if err != nil {
 		return nil, err
 	}
 
+	// Import friends if requested.
+	if in.Sync != nil && in.Sync.Value {
+		_ = importSteamFriends(ctx, s.logger, s.db, s.router, s.socialClient, uuid.FromStringOrNil(dbUserID), dbUsername, s.config.GetSocial().Steam.PublisherKey, steamID, false)
+	}
+
 	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
-	session := &api.Session{Created: created, Token: token}
+	refreshToken, _ := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateSteam(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -539,17 +676,22 @@ func (s *ApiServer) AuthenticateSteam(ctx context.Context, in *api.AuthenticateS
 
 func generateToken(config Config, userID, username string, vars map[string]string) (string, int64) {
 	exp := time.Now().UTC().Add(time.Duration(config.GetSession().TokenExpirySec) * time.Second).Unix()
-	return generateTokenWithExpiry(config, userID, username, vars, exp)
+	return generateTokenWithExpiry(config.GetSession().EncryptionKey, userID, username, vars, exp)
 }
 
-func generateTokenWithExpiry(config Config, userID, username string, vars map[string]string, exp int64) (string, int64) {
+func generateRefreshToken(config Config, userID string, username string, vars map[string]string) (string, int64) {
+	exp := time.Now().UTC().Add(time.Duration(config.GetSession().RefreshTokenExpirySec) * time.Second).Unix()
+	return generateTokenWithExpiry(config.GetSession().RefreshEncryptionKey, userID, username, vars, exp)
+}
+
+func generateTokenWithExpiry(signingKey, userID, username string, vars map[string]string, exp int64) (string, int64) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, &SessionTokenClaims{
 		UserId:    userID,
 		Username:  username,
 		Vars:      vars,
 		ExpiresAt: exp,
 	})
-	signedToken, _ := token.SignedString([]byte(config.GetSession().EncryptionKey))
+	signedToken, _ := token.SignedString([]byte(signingKey))
 	return signedToken, exp
 }
 

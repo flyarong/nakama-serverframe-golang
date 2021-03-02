@@ -17,22 +17,65 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/base64"
+	"encoding/gob"
 	"encoding/json"
-	"fmt"
-	"golang.org/x/crypto/bcrypt"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/pgtype"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/gofrs/uuid"
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/golang/protobuf/ptypes/timestamp"
 	"github.com/heroiclabs/nakama-common/api"
-	"github.com/heroiclabs/nakama/v2/console"
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/heroiclabs/nakama/v3/console"
 )
+
+type consoleAccountCursor struct {
+	ID       uuid.UUID
+	Username string
+}
+
+func (s *ConsoleServer) BanAccount(ctx context.Context, in *console.AccountId) (*empty.Empty, error) {
+	userID, err := uuid.FromString(in.Id)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "Requires a valid user ID.")
+	}
+	if userID == uuid.Nil {
+		return nil, status.Error(codes.InvalidArgument, "Cannot ban the system user.")
+	}
+
+	if err := BanUsers(ctx, s.logger, s.db, []string{in.Id}); err != nil {
+		// Error logged in the core function above.
+		return nil, status.Error(codes.Internal, "An error occurred while trying to ban the user.")
+	}
+
+	return &empty.Empty{}, nil
+}
+
+func (s *ConsoleServer) UnbanAccount(ctx context.Context, in *console.AccountId) (*empty.Empty, error) {
+	userID, err := uuid.FromString(in.Id)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "Requires a valid user ID.")
+	}
+	if userID == uuid.Nil {
+		return nil, status.Error(codes.InvalidArgument, "Cannot unban the system user.")
+	}
+
+	if err := UnbanUsers(ctx, s.logger, s.db, []string{in.Id}); err != nil {
+		// Error logged in the core function above.
+		return nil, status.Error(codes.Internal, "An error occurred while trying to unban the user.")
+	}
+
+	return &empty.Empty{}, nil
+}
 
 func (s *ConsoleServer) DeleteAccount(ctx context.Context, in *console.AccountDeleteRequest) (*empty.Empty, error) {
 	userID, err := uuid.FromString(in.Id)
@@ -48,6 +91,16 @@ func (s *ConsoleServer) DeleteAccount(ctx context.Context, in *console.AccountDe
 		return nil, status.Error(codes.Internal, "An error occurred while trying to delete the user.")
 	}
 
+	return &empty.Empty{}, nil
+}
+
+func (s *ConsoleServer) DeleteAccounts(ctx context.Context, in *empty.Empty) (*empty.Empty, error) {
+	// Delete all but the system user. Related data will be removed by cascading constraints.
+	_, err := s.db.ExecContext(ctx, "DELETE FROM users WHERE id <> '00000000-0000-0000-0000-000000000000'")
+	if err != nil {
+		s.logger.Error("Error deleting all user accounts.", zap.Error(err))
+		return nil, status.Error(codes.Internal, "An error occurred while trying to delete all users.")
+	}
 	return &empty.Empty{}, nil
 }
 
@@ -127,7 +180,7 @@ func (s *ConsoleServer) GetAccount(ctx context.Context, in *console.AccountId) (
 		return nil, status.Error(codes.InvalidArgument, "Requires a valid user ID.")
 	}
 
-	account, disableTime, err := GetAccount(ctx, s.logger, s.db, s.tracker, userID)
+	account, err := GetAccount(ctx, s.logger, s.db, s.tracker, userID)
 	if err != nil {
 		// Error already logged in function above.
 		if err == ErrAccountNotFound {
@@ -136,12 +189,10 @@ func (s *ConsoleServer) GetAccount(ctx context.Context, in *console.AccountId) (
 		return nil, status.Error(codes.Internal, "An error occurred while trying to retrieve user account.")
 	}
 
-	acc := &console.Account{Account: account}
-	if disableTime.Unix() != 0 {
-		acc.DisableTime = &timestamp.Timestamp{Seconds: disableTime.Unix()}
-	}
-
-	return acc, nil
+	return &console.Account{
+		Account:     account,
+		DisableTime: account.DisableTime,
+	}, nil
 }
 
 func (s *ConsoleServer) GetFriends(ctx context.Context, in *console.AccountId) (*api.FriendList, error) {
@@ -210,6 +261,188 @@ func (s *ConsoleServer) GetWalletLedger(ctx context.Context, in *console.Account
 	}
 
 	return &console.WalletLedgerList{Items: consoleLedger}, nil
+}
+
+func (s *ConsoleServer) ListAccounts(ctx context.Context, in *console.ListAccountsRequest) (*console.AccountList, error) {
+	const defaultLimit = 50
+
+	// Searching only through tombstone records.
+	if in.Tombstones {
+		var userID *uuid.UUID
+		if in.Filter != "" {
+			uid, err := uuid.FromString(in.Filter)
+			if err != nil {
+				// Filtering for a tombstone using username, no results are possible.
+				return &console.AccountList{
+					TotalCount: 0,
+				}, nil
+			}
+			userID = &uid
+		}
+
+		if userID != nil {
+			// Looking up a single specific tombstone.
+			var createTime pgtype.Timestamptz
+			err := s.db.QueryRowContext(ctx, "SELECT create_time FROM user_tombstone WHERE user_id = $1", *userID).Scan(&createTime)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					return &console.AccountList{
+						TotalCount: 0,
+					}, nil
+				}
+				s.logger.Error("Error looking up user tombstone.", zap.Any("in", in), zap.Error(err))
+				return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
+			}
+
+			return &console.AccountList{
+				Users: []*api.User{
+					{
+						Id:         in.Filter,
+						UpdateTime: &timestamp.Timestamp{Seconds: createTime.Time.Unix()},
+					},
+				},
+				TotalCount: 1,
+			}, nil
+		}
+
+		query := "SELECT user_id, create_time FROM user_tombstone LIMIT $1"
+		rows, err := s.db.QueryContext(ctx, query, defaultLimit)
+		if err != nil {
+			s.logger.Error("Error querying user tombstones.", zap.Any("in", in), zap.Error(err))
+			return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
+		}
+
+		users := make([]*api.User, 0, defaultLimit)
+
+		for rows.Next() {
+			var id string
+			var createTime pgtype.Timestamptz
+			if err = rows.Scan(&id, &createTime); err != nil {
+				_ = rows.Close()
+				s.logger.Error("Error scanning user tombstones.", zap.Any("in", in), zap.Error(err))
+				return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
+			}
+
+			users = append(users, &api.User{
+				Id:         id,
+				UpdateTime: &timestamp.Timestamp{Seconds: createTime.Time.Unix()},
+			})
+		}
+		_ = rows.Close()
+
+		return &console.AccountList{
+			Users:      users,
+			TotalCount: countDatabase(ctx, s.logger, s.db, "user_tombstone"),
+		}, nil
+	}
+
+	// Listing live (non-tombstone) users.
+	// Validate cursor, if provided.
+	var cursor *consoleAccountCursor
+	if in.Cursor != "" {
+		cb, err := base64.RawURLEncoding.DecodeString(in.Cursor)
+		if err != nil {
+			s.logger.Error("Error decoding account list cursor.", zap.String("cursor", in.Cursor), zap.Error(err))
+			return nil, status.Error(codes.Internal, "An error occurred while trying to decode account list request cursor.")
+		}
+		cursor = &consoleAccountCursor{}
+		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(&cursor); err != nil {
+			s.logger.Error("Error decoding account list cursor.", zap.String("cursor", in.Cursor), zap.Error(err))
+			return nil, status.Error(codes.Internal, "An error occurred while trying to decode account list request cursor.")
+		}
+	}
+
+	// Check if we have a filter and it's a user ID.
+	var userIDFilter *uuid.UUID
+	if in.Filter != "" {
+		userID, err := uuid.FromString(in.Filter)
+		if err == nil {
+			userIDFilter = &userID
+		}
+	}
+
+	limit := defaultLimit
+	var params []interface{}
+	var query string
+
+	switch {
+	case userIDFilter != nil:
+		// Filtering for a single exact user ID. Querying on primary key (id).
+		query = "SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time FROM users WHERE id = $1"
+		params = []interface{}{*userIDFilter}
+		limit = 0
+		// Pagination not possible.
+	case in.Filter != "" && strings.Contains(in.Filter, "%"):
+		// Filtering for a partial username. Querying and paginating on unique index (username).
+		query = "SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time FROM users WHERE username ILIKE $1"
+		params = []interface{}{in.Filter}
+		// Pagination is possible.
+		if cursor != nil {
+			query += " AND username > $2"
+			params = append(params, cursor.Username)
+		}
+		// Order and limit.
+		params = append(params, limit+1)
+		query += "ORDER BY username ASC LIMIT $" + strconv.Itoa(len(params))
+	case in.Filter != "":
+		// Filtering for an exact username. Querying on unique index (username).
+		query = "SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time FROM users WHERE username = $1"
+		params = []interface{}{in.Filter}
+		limit = 0
+		// Pagination not possible.
+	case cursor != nil:
+		// Non-filtered, but paginated query. Assume pagination on user ID. Querying and paginating on primary key (id).
+		query = "SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time FROM users WHERE id > $1 ORDER BY id ASC LIMIT $2"
+		params = []interface{}{cursor.ID, limit + 1}
+	default:
+		// Non-filtered, non-paginated query. Querying and paginating on primary key (id).
+		query = "SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time FROM users ORDER BY id ASC LIMIT $1"
+		params = []interface{}{limit + 1}
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, params...)
+	if err != nil {
+		s.logger.Error("Error querying users.", zap.Any("in", in), zap.Error(err))
+		return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
+	}
+
+	users := make([]*api.User, 0, defaultLimit)
+	var nextCursor *consoleAccountCursor
+
+	for rows.Next() {
+		user, err := convertUser(s.tracker, rows)
+		if err != nil {
+			_ = rows.Close()
+			s.logger.Error("Error scanning users.", zap.Any("in", in), zap.Error(err))
+			return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
+		}
+
+		users = append(users, user)
+		if limit > 0 && len(users) >= limit {
+			nextCursor = &consoleAccountCursor{
+				ID:       uuid.FromStringOrNil(user.Id),
+				Username: user.Username,
+			}
+			break
+		}
+	}
+	_ = rows.Close()
+
+	response := &console.AccountList{
+		Users:      users,
+		TotalCount: countDatabase(ctx, s.logger, s.db, "users"),
+	}
+
+	if nextCursor != nil {
+		cursorBuf := &bytes.Buffer{}
+		if err := gob.NewEncoder(cursorBuf).Encode(nextCursor); err != nil {
+			s.logger.Error("Error encoding users cursor.", zap.Any("in", in), zap.Error(err))
+			return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
+		}
+		response.NextCursor = base64.RawURLEncoding.EncodeToString(cursorBuf.Bytes())
+	}
+
+	return response, nil
 }
 
 func (s *ConsoleServer) UpdateAccount(ctx context.Context, in *console.UpdateAccountRequest) (*empty.Empty, error) {
@@ -337,12 +570,14 @@ func (s *ConsoleServer) UpdateAccount(ctx context.Context, in *console.UpdateAcc
 	}
 
 	if v := in.Wallet; v != nil && v.Value != "" {
-		var walletMap map[string]interface{}
+		var walletMap map[string]int64
 		if err := json.Unmarshal([]byte(v.Value), &walletMap); err != nil {
-			return nil, status.Error(codes.InvalidArgument, "Wallet must be a valid JSON object.")
+			return nil, status.Error(codes.InvalidArgument, "Wallet must be a valid JSON object with only string keys and integer values.")
 		}
-		if err := checkWalletFormat(walletMap, ""); err != nil {
-			return nil, status.Error(codes.InvalidArgument, err.Error())
+		for k, v := range walletMap {
+			if v < 0 {
+				return nil, status.Errorf(codes.InvalidArgument, "Wallet rejected negative value at path '%v'.", k)
+			}
 		}
 		params = append(params, v.Value)
 		statements = append(statements, "wallet = $"+strconv.Itoa(len(params)))
@@ -365,7 +600,7 @@ func (s *ConsoleServer) UpdateAccount(ctx context.Context, in *console.UpdateAcc
 		}
 	}
 
-	if len(statements) == 0 && !removeCustomID && !removeEmail && len(in.DeviceIds) == 0 {
+	if len(statements) == 0 && !removeCustomID && !removeEmail && len(in.DeviceIds) == 0 && len(newPassword) == 0 {
 		// Nothing to update.
 		return &empty.Empty{}, nil
 	}
@@ -381,7 +616,9 @@ func (s *ConsoleServer) UpdateAccount(ctx context.Context, in *console.UpdateAcc
 			if newDeviceID == "" {
 				query := `DELETE FROM user_device WHERE id = $2 AND user_id = $1
 AND (EXISTS (SELECT id FROM users WHERE id = $1 AND
-    (facebook_id IS NOT NULL
+    (apple_id IS NOT NULL
+     OR facebook_id IS NOT NULL
+     OR facebook_instant_game_id IS NOT NULL
      OR google_id IS NOT NULL
      OR gamecenter_id IS NOT NULL
      OR steam_id IS NOT NULL
@@ -506,32 +743,4 @@ AND ((facebook_id IS NOT NULL
 	}
 
 	return &empty.Empty{}, nil
-}
-
-func checkWalletFormat(wallet map[string]interface{}, path string) error {
-	for k, v := range wallet {
-		var currentPath string
-		if path == "" {
-			currentPath = k
-		} else {
-			currentPath = fmt.Sprintf("%v.%v", path, k)
-		}
-
-		if vm, ok := v.(map[string]interface{}); ok {
-			// Nested wallets are fine.
-			if err := checkWalletFormat(vm, currentPath); err != nil {
-				return err
-			}
-		} else if vf, ok := v.(float64); ok {
-			// If it's a value, check it's not negative.
-			if vf < 0 {
-				return errors.Errorf("Wallet rejected negative value at path '%v'.", currentPath)
-			}
-		} else {
-			// Not a nested wallet a value.
-			return errors.Errorf("Wallet value type at path '%v' must be map or float64.", currentPath)
-		}
-	}
-
-	return nil
 }

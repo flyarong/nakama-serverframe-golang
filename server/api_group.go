@@ -44,7 +44,7 @@ func (s *ApiServer) CreateGroup(ctx context.Context, in *api.CreateGroupRequest)
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -72,12 +72,12 @@ func (s *ApiServer) CreateGroup(ctx context.Context, in *api.CreateGroupRequest)
 
 	// After hook.
 	if fn := s.runtime.AfterCreateGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, group, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, group, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return group, nil
@@ -103,7 +103,7 @@ func (s *ApiServer) UpdateGroup(ctx context.Context, in *api.UpdateGroupRequest)
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -144,12 +144,12 @@ func (s *ApiServer) UpdateGroup(ctx context.Context, in *api.UpdateGroupRequest)
 
 	// After hook.
 	if fn := s.runtime.AfterUpdateGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &empty.Empty{}, nil
@@ -175,7 +175,7 @@ func (s *ApiServer) DeleteGroup(ctx context.Context, in *api.DeleteGroupRequest)
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -200,12 +200,12 @@ func (s *ApiServer) DeleteGroup(ctx context.Context, in *api.DeleteGroupRequest)
 
 	// After hook.
 	if fn := s.runtime.AfterDeleteGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &empty.Empty{}, nil
@@ -232,7 +232,7 @@ func (s *ApiServer) JoinGroup(ctx context.Context, in *api.JoinGroupRequest) (*e
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -259,12 +259,12 @@ func (s *ApiServer) JoinGroup(ctx context.Context, in *api.JoinGroupRequest) (*e
 
 	// After hook.
 	if fn := s.runtime.AfterJoinGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &empty.Empty{}, nil
@@ -291,7 +291,7 @@ func (s *ApiServer) LeaveGroup(ctx context.Context, in *api.LeaveGroupRequest) (
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -316,12 +316,12 @@ func (s *ApiServer) LeaveGroup(ctx context.Context, in *api.LeaveGroupRequest) (
 
 	// After hook.
 	if fn := s.runtime.AfterLeaveGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &empty.Empty{}, nil
@@ -347,7 +347,7 @@ func (s *ApiServer) AddGroupUsers(ctx context.Context, in *api.AddGroupUsersRequ
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -389,12 +389,12 @@ func (s *ApiServer) AddGroupUsers(ctx context.Context, in *api.AddGroupUsersRequ
 
 	// After hook.
 	if fn := s.runtime.AfterAddGroupUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &empty.Empty{}, nil
@@ -420,7 +420,7 @@ func (s *ApiServer) BanGroupUsers(ctx context.Context, in *api.BanGroupUsersRequ
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -457,12 +457,12 @@ func (s *ApiServer) BanGroupUsers(ctx context.Context, in *api.BanGroupUsersRequ
 
 	// After hook.
 	if fn := s.runtime.AfterBanGroupUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &empty.Empty{}, nil
@@ -488,7 +488,7 @@ func (s *ApiServer) KickGroupUsers(ctx context.Context, in *api.KickGroupUsersRe
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -525,12 +525,12 @@ func (s *ApiServer) KickGroupUsers(ctx context.Context, in *api.KickGroupUsersRe
 
 	// After hook.
 	if fn := s.runtime.AfterKickGroupUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &empty.Empty{}, nil
@@ -556,7 +556,7 @@ func (s *ApiServer) PromoteGroupUsers(ctx context.Context, in *api.PromoteGroupU
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -596,12 +596,12 @@ func (s *ApiServer) PromoteGroupUsers(ctx context.Context, in *api.PromoteGroupU
 
 	// After hook.
 	if fn := s.runtime.AfterPromoteGroupUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &empty.Empty{}, nil
@@ -625,7 +625,7 @@ func (s *ApiServer) ListGroupUsers(ctx context.Context, in *api.ListGroupUsersRe
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -665,15 +665,86 @@ func (s *ApiServer) ListGroupUsers(ctx context.Context, in *api.ListGroupUsersRe
 
 	// After hook.
 	if fn := s.runtime.AfterListGroupUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, groupUsers, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, groupUsers, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return groupUsers, nil
+}
+
+func (s *ApiServer) DemoteGroupUsers(ctx context.Context, in *api.DemoteGroupUsersRequest) (*empty.Empty, error) {
+	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+
+	// Before hook.
+	if fn := s.runtime.BeforeDemoteGroupUsers(); fn != nil {
+		beforeFn := func(clientIP, clientPort string) error {
+			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			if err != nil {
+				return status.Error(code, err.Error())
+			}
+			if result == nil {
+				// If result is nil, requested resource is disabled.
+				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
+				return status.Error(codes.NotFound, "Requested resource was not found.")
+			}
+			in = result
+			return nil
+		}
+
+		// Execute the before function lambda wrapped in a trace for stats measurement.
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if in.GetGroupId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "Group ID must be set.")
+	}
+
+	groupID, err := uuid.FromString(in.GetGroupId())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "Group ID must be a valid ID.")
+	}
+
+	if len(in.GetUserIds()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "User IDs must be set.")
+	}
+
+	userIDs := make([]uuid.UUID, 0, len(in.GetUserIds()))
+	for _, id := range in.GetUserIds() {
+		uid := uuid.FromStringOrNil(id)
+		if uid == uuid.Nil {
+			return nil, status.Error(codes.InvalidArgument, "User ID must be a valid ID.")
+		}
+		userIDs = append(userIDs, uid)
+	}
+
+	err = DemoteGroupUsers(ctx, s.logger, s.db, s.router, userID, groupID, userIDs)
+	if err != nil {
+		if err == ErrGroupPermissionDenied {
+			return nil, status.Error(codes.NotFound, "Group not found or permission denied.")
+		} else if err == ErrGroupFull {
+			return nil, status.Error(codes.InvalidArgument, "Group is full.")
+		}
+		return nil, status.Error(codes.Internal, "Error while trying to demote users in a group.")
+	}
+
+	// After hook.
+	if fn := s.runtime.AfterDemoteGroupUsers(); fn != nil {
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		}
+
+		// Execute the after function lambda wrapped in a trace for stats measurement.
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+	}
+
+	return &empty.Empty{}, nil
 }
 
 func (s *ApiServer) ListUserGroups(ctx context.Context, in *api.ListUserGroupsRequest) (*api.UserGroupList, error) {
@@ -694,7 +765,7 @@ func (s *ApiServer) ListUserGroups(ctx context.Context, in *api.ListUserGroupsRe
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -734,12 +805,12 @@ func (s *ApiServer) ListUserGroups(ctx context.Context, in *api.ListUserGroupsRe
 
 	// After hook.
 	if fn := s.runtime.AfterListUserGroups(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, userGroups, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, userGroups, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return userGroups, nil
@@ -763,7 +834,7 @@ func (s *ApiServer) ListGroups(ctx context.Context, in *api.ListGroupsRequest) (
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -784,12 +855,12 @@ func (s *ApiServer) ListGroups(ctx context.Context, in *api.ListGroupsRequest) (
 
 	// After hook.
 	if fn := s.runtime.AfterListGroups(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, groups, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, groups, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return groups, nil

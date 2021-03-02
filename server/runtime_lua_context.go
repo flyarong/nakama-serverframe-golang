@@ -18,12 +18,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/yuin/gopher-lua"
+	"github.com/heroiclabs/nakama/v3/internal/gopher-lua"
 )
 
 const (
 	__RUNTIME_LUA_CTX_ENV              = "env"
 	__RUNTIME_LUA_CTX_MODE             = "execution_mode"
+	__RUNTIME_LUA_CTX_NODE             = "node"
 	__RUNTIME_LUA_CTX_QUERY_PARAMS     = "query_params"
 	__RUNTIME_LUA_CTX_USER_ID          = "user_id"
 	__RUNTIME_LUA_CTX_USERNAME         = "username"
@@ -38,7 +39,7 @@ const (
 	__RUNTIME_LUA_CTX_MATCH_TICK_RATE  = "match_tick_rate"
 )
 
-func NewRuntimeLuaContext(l *lua.LState, env *lua.LTable, mode RuntimeExecutionMode, queryParams map[string][]string, sessionExpiry int64, userID, username string, vars map[string]string, sessionID, clientIP, clientPort string) *lua.LTable {
+func NewRuntimeLuaContext(l *lua.LState, node string, env *lua.LTable, mode RuntimeExecutionMode, queryParams map[string][]string, sessionExpiry int64, userID, username string, vars map[string]string, sessionID, clientIP, clientPort string) *lua.LTable {
 	size := 3
 	if userID != "" {
 		size += 3
@@ -57,6 +58,7 @@ func NewRuntimeLuaContext(l *lua.LState, env *lua.LTable, mode RuntimeExecutionM
 	lt := l.CreateTable(0, size)
 	lt.RawSetString(__RUNTIME_LUA_CTX_ENV, env)
 	lt.RawSetString(__RUNTIME_LUA_CTX_MODE, lua.LString(mode.String()))
+	lt.RawSetString(__RUNTIME_LUA_CTX_NODE, lua.LString(node))
 	if queryParams == nil {
 		lt.RawSetString(__RUNTIME_LUA_CTX_QUERY_PARAMS, l.CreateTable(0, 0))
 	} else {
@@ -109,6 +111,16 @@ func RuntimeLuaConvertMap(l *lua.LState, data map[string]interface{}) *lua.LTabl
 	return lt
 }
 
+func RuntimeLuaConvertMapInt64(l *lua.LState, data map[string]int64) *lua.LTable {
+	lt := l.CreateTable(0, len(data))
+
+	for k, v := range data {
+		lt.RawSetString(k, RuntimeLuaConvertValue(l, v))
+	}
+
+	return lt
+}
+
 func RuntimeLuaConvertLuaTable(lv *lua.LTable) map[string]interface{} {
 	returnData, _ := RuntimeLuaConvertLuaValue(lv).(map[string]interface{})
 	return returnData
@@ -152,6 +164,8 @@ func RuntimeLuaConvertValue(l *lua.LState, val interface{}) lua.LValue {
 		return lt
 	case map[string]string:
 		return RuntimeLuaConvertMapString(l, v)
+	case map[string]int64:
+		return RuntimeLuaConvertMapInt64(l, v)
 	case map[string]interface{}:
 		return RuntimeLuaConvertMap(l, v)
 	case []string:

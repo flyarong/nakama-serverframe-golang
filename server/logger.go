@@ -15,16 +15,13 @@
 package server
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
-	"time"
-
 	"strings"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"gopkg.in/natefinch/lumberjack.v2"
+	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
 type LoggingFormat int8
@@ -125,7 +122,7 @@ func NewRotatingJSONFileLogger(consoleLogger *zap.Logger, config Config, level z
 		Compress:   config.GetLogger().Compress,
 	})
 	core := zapcore.NewCore(jsonEncoder, writeSyncer, level)
-	options := []zap.Option{zap.AddStacktrace(zap.ErrorLevel)}
+	options := []zap.Option{zap.AddCaller()}
 	return zap.New(core, options...)
 }
 
@@ -136,7 +133,7 @@ func NewMultiLogger(loggers ...*zap.Logger) *zap.Logger {
 	}
 
 	teeCore := zapcore.NewTee(cores...)
-	options := []zap.Option{zap.AddStacktrace(zap.ErrorLevel)}
+	options := []zap.Option{zap.AddCaller()}
 	return zap.New(teeCore, options...)
 }
 
@@ -144,7 +141,7 @@ func NewJSONLogger(output *os.File, level zapcore.Level, format LoggingFormat) *
 	jsonEncoder := newJSONEncoder(format)
 
 	core := zapcore.NewCore(jsonEncoder, zapcore.Lock(output), level)
-	options := []zap.Option{zap.AddStacktrace(zap.ErrorLevel)}
+	options := []zap.Option{zap.AddCaller()}
 	return zap.New(core, options...)
 }
 
@@ -159,7 +156,7 @@ func newJSONEncoder(format LoggingFormat) zapcore.Encoder {
 			MessageKey:     "msg",
 			StacktraceKey:  "stacktrace",
 			EncodeLevel:    StackdriverLevelEncoder,
-			EncodeTime:     StackdriverTimeEncoder,
+			EncodeTime:     zapcore.RFC3339TimeEncoder,
 			EncodeDuration: zapcore.StringDurationEncoder,
 			EncodeCaller:   zapcore.ShortCallerEncoder,
 		})
@@ -179,27 +176,23 @@ func newJSONEncoder(format LoggingFormat) zapcore.Encoder {
 	})
 }
 
-func StackdriverTimeEncoder(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-	enc.AppendString(fmt.Sprintf("%d%s", t.Unix(), t.Format(".000000000")))
-}
-
 func StackdriverLevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
 	switch l {
 	case zapcore.DebugLevel:
-		enc.AppendString("debug")
+		enc.AppendString("DEBUG")
 	case zapcore.InfoLevel:
-		enc.AppendString("info")
+		enc.AppendString("INFO")
 	case zapcore.WarnLevel:
-		enc.AppendString("warning")
+		enc.AppendString("WARNING")
 	case zapcore.ErrorLevel:
-		enc.AppendString("error")
+		enc.AppendString("ERROR")
 	case zapcore.DPanicLevel:
-		enc.AppendString("critical")
+		enc.AppendString("CRITICAL")
 	case zapcore.PanicLevel:
-		enc.AppendString("critical")
+		enc.AppendString("CRITICAL")
 	case zapcore.FatalLevel:
-		enc.AppendString("critical")
+		enc.AppendString("CRITICAL")
 	default:
-		enc.AppendString(fmt.Sprintf("Level(%d)", l))
+		enc.AppendString("DEFAULT")
 	}
 }

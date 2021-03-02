@@ -17,17 +17,15 @@ package server
 import (
 	"context"
 	"crypto"
+	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
 	"fmt"
+	"google.golang.org/protobuf/encoding/protojson"
 	"net"
 	"net/http"
 	"strings"
 	"time"
-
-	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
-	"go.opencensus.io/trace"
 
 	"github.com/heroiclabs/nakama-common/api"
 
@@ -44,11 +42,9 @@ import (
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
-	grpcRuntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"github.com/heroiclabs/nakama/v2/apigrpc"
-	"github.com/heroiclabs/nakama/v2/social"
-	"go.opencensus.io/plugin/ocgrpc"
-	"go.opencensus.io/plugin/ochttp"
+	grpcgw "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/heroiclabs/nakama/v3/apigrpc"
+	"github.com/heroiclabs/nakama/v3/social"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -70,6 +66,7 @@ type ctxExpiryKey struct{}
 type ctxFullMethodKey struct{}
 
 type ApiServer struct {
+	apigrpc.UnimplementedNakamaServer
 	logger               *zap.Logger
 	db                   *sql.DB
 	config               Config
@@ -79,24 +76,25 @@ type ApiServer struct {
 	matchRegistry        MatchRegistry
 	tracker              Tracker
 	router               MessageRouter
+	metrics              *Metrics
 	runtime              *Runtime
 	grpcServer           *grpc.Server
 	grpcGatewayServer    *http.Server
 }
 
-func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, jsonpbMarshaler *jsonpb.Marshaler, jsonpbUnmarshaler *jsonpb.Unmarshaler, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, matchRegistry MatchRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, pipeline *Pipeline, runtime *Runtime) *ApiServer {
+func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, jsonpbMarshaler *jsonpb.Marshaler, jsonpbUnmarshaler *jsonpb.Unmarshaler, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, statusRegistry *StatusRegistry, matchRegistry MatchRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, metrics *Metrics, pipeline *Pipeline, runtime *Runtime) *ApiServer {
 	var gatewayContextTimeoutMs string
 	if config.GetSocket().IdleTimeoutMs > 500 {
 		// Ensure the GRPC Gateway timeout is just under the idle timeout (if possible) to ensure it has priority.
-		grpcRuntime.DefaultContextTimeout = time.Duration(config.GetSocket().IdleTimeoutMs-500) * time.Millisecond
+		grpcgw.DefaultContextTimeout = time.Duration(config.GetSocket().IdleTimeoutMs-500) * time.Millisecond
 		gatewayContextTimeoutMs = fmt.Sprintf("%vm", config.GetSocket().IdleTimeoutMs-500)
 	} else {
-		grpcRuntime.DefaultContextTimeout = time.Duration(config.GetSocket().IdleTimeoutMs) * time.Millisecond
+		grpcgw.DefaultContextTimeout = time.Duration(config.GetSocket().IdleTimeoutMs) * time.Millisecond
 		gatewayContextTimeoutMs = fmt.Sprintf("%vm", config.GetSocket().IdleTimeoutMs)
 	}
 
 	serverOpts := []grpc.ServerOption{
-		grpc.StatsHandler(&ocgrpc.ServerHandler{IsPublicEndpoint: true}),
+		grpc.StatsHandler(&MetricsGrpcHandler{metrics: metrics}),
 		grpc.MaxRecvMsgSize(int(config.GetSocket().MaxRequestSizeBytes)),
 		grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 			ctx, err := securityInterceptorFunc(logger, config, ctx, req, info)
@@ -121,6 +119,7 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, j
 		matchRegistry:        matchRegistry,
 		tracker:              tracker,
 		router:               router,
+		metrics:              metrics,
 		runtime:              runtime,
 		grpcServer:           grpcServer,
 	}
@@ -142,8 +141,8 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, j
 	// Register and start GRPC Gateway server.
 	// Should start after GRPC server itself because RegisterNakamaHandlerFromEndpoint below tries to dial GRPC.
 	ctx := context.Background()
-	grpcGateway := grpcRuntime.NewServeMux(
-		grpcRuntime.WithMetadata(func(ctx context.Context, r *http.Request) metadata.MD {
+	grpcGateway := grpcgw.NewServeMux(
+		grpcgw.WithMetadata(func(ctx context.Context, r *http.Request) metadata.MD {
 			// For RPC GET operations pass through any custom query parameters.
 			if r.Method != "GET" || !strings.HasPrefix(r.URL.Path, "/v2/rpc/") {
 				return metadata.MD{}
@@ -160,21 +159,37 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, j
 			}
 			return metadata.MD(p)
 		}),
+		grpcgw.WithMarshalerOption(grpcgw.MIMEWildcard, &grpcgw.HTTPBodyMarshaler{
+			Marshaler: &grpcgw.JSONPb{
+				MarshalOptions: protojson.MarshalOptions{
+					UseProtoNames:  true,
+					UseEnumNumbers: true,
+				},
+				UnmarshalOptions: protojson.UnmarshalOptions{
+					DiscardUnknown: true,
+				},
+			},
+		}),
 	)
 	dialAddr := fmt.Sprintf("127.0.0.1:%d", config.GetSocket().Port-1)
 	if config.GetSocket().Address != "" {
 		dialAddr = fmt.Sprintf("%v:%d", config.GetSocket().Address, config.GetSocket().Port-1)
 	}
 	dialOpts := []grpc.DialOption{
-		//TODO (mo, zyro): Do we need to pass the statsHandler here as well?
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallSendMsgSize(int(config.GetSocket().MaxRequestSizeBytes)),
 			grpc.MaxCallRecvMsgSize(1024*1024*128),
 		),
-		grpc.WithStatsHandler(&ocgrpc.ClientHandler{}),
+		//grpc.WithStatsHandler(&ocgrpc.ClientHandler{}),
 	}
 	if config.GetSocket().TLSCert != nil {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewServerTLSFromCert(&config.GetSocket().TLSCert[0])))
+		// GRPC-Gateway only ever dials 127.0.0.1 so we can be lenient on server certificate validation.
+		certPool := x509.NewCertPool()
+		if !certPool.AppendCertsFromPEM(config.GetSocket().CertPEMBlock) {
+			startupLogger.Fatal("Failed to load PEM certificate from socket SSL certificate file")
+		}
+		cert := credentials.NewTLS(&tls.Config{RootCAs: certPool, InsecureSkipVerify: true})
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(cert))
 	} else {
 		dialOpts = append(dialOpts, grpc.WithInsecure())
 	}
@@ -188,7 +203,7 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, j
 	grpcGatewayRouter := mux.NewRouter()
 	// Special case routes. Do NOT enable compression on WebSocket route, it results in "http: response.Write on hijacked connection" errors.
 	grpcGatewayRouter.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }).Methods("GET")
-	grpcGatewayRouter.HandleFunc("/ws", NewSocketWsAcceptor(logger, config, sessionRegistry, matchmaker, tracker, runtime, jsonpbMarshaler, jsonpbUnmarshaler, pipeline)).Methods("GET")
+	grpcGatewayRouter.HandleFunc("/ws", NewSocketWsAcceptor(logger, config, sessionRegistry, statusRegistry, matchmaker, tracker, metrics, runtime, jsonpbMarshaler, jsonpbUnmarshaler, pipeline)).Methods("GET")
 
 	// Another nested router to hijack RPC requests bound for GRPC Gateway.
 	grpcGatewayMux := mux.NewRouter()
@@ -198,16 +213,16 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, j
 	// Enable stats recording on all request paths except:
 	// "/" is not tracked at all.
 	// "/ws" implements its own separate tracking.
-	handlerWithStats := &ochttp.Handler{
-		Handler:          grpcGatewayMux,
-		IsPublicEndpoint: true,
-	}
+	//handlerWithStats := &ochttp.Handler{
+	//	Handler:          grpcGatewayMux,
+	//	IsPublicEndpoint: true,
+	//}
 
 	// Default to passing request to GRPC Gateway.
 	// Enable max size check on requests coming arriving the gateway.
 	// Enable compression on responses sent by the gateway.
 	// Enable decompression on requests received by the gateway.
-	handlerWithDecompressRequest := decompressHandler(logger, handlerWithStats)
+	handlerWithDecompressRequest := decompressHandler(logger, grpcGatewayMux)
 	handlerWithCompressResponse := handlers.CompressHandler(handlerWithDecompressRequest)
 	maxMessageSizeBytes := config.GetSocket().MaxRequestSizeBytes
 	handlerWithMaxBody := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -284,6 +299,10 @@ func securityInterceptorFunc(logger *zap.Logger, config Config, ctx context.Cont
 	case "/nakama.api.Nakama/Healthcheck":
 		// Healthcheck has no security.
 		return ctx, nil
+	case "/nakama.api.Nakama/SessionRefresh":
+		fallthrough
+	case "/nakama.api.Nakama/AuthenticateApple":
+		fallthrough
 	case "/nakama.api.Nakama/AuthenticateCustom":
 		fallthrough
 	case "/nakama.api.Nakama/AuthenticateDevice":
@@ -292,12 +311,14 @@ func securityInterceptorFunc(logger *zap.Logger, config Config, ctx context.Cont
 		fallthrough
 	case "/nakama.api.Nakama/AuthenticateFacebook":
 		fallthrough
+	case "/nakama.api.Nakama/AuthenticateFacebookInstantGame":
+		fallthrough
 	case "/nakama.api.Nakama/AuthenticateGameCenter":
 		fallthrough
 	case "/nakama.api.Nakama/AuthenticateGoogle":
 		fallthrough
 	case "/nakama.api.Nakama/AuthenticateSteam":
-		// Authentication functions require Server key.
+		// Session refresh and authentication functions only require server key.
 		md, ok := metadata.FromIncomingContext(ctx)
 		if !ok {
 			logger.Error("Cannot extract metadata from incoming context")
@@ -513,41 +534,24 @@ func extractClientAddress(logger *zap.Logger, clientAddr string) (string, string
 	return clientIP, clientPort
 }
 
-func traceApiBefore(ctx context.Context, logger *zap.Logger, fullMethodName string, fn func(clientIP, clientPort string) error) error {
-	name := fmt.Sprintf("%v-before", fullMethodName)
+func traceApiBefore(ctx context.Context, logger *zap.Logger, metrics *Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) error {
 	clientIP, clientPort := extractClientAddressFromContext(logger, ctx)
-	statsCtx, err := tag.New(ctx, tag.Upsert(MetricsFunction, name))
-	if err != nil {
-		// If there was an error processing the stats, just execute the function.
-		logger.Warn("Error tagging API before stats", zap.String("full_method_name", fullMethodName), zap.Error(err))
-		return fn(clientIP, clientPort)
-	}
-	startNanos := time.Now().UTC().UnixNano()
-	statsCtx, span := trace.StartSpan(statsCtx, name)
+	start := time.Now()
 
-	err = fn(clientIP, clientPort)
+	// Execute the before hook itself.
+	err := fn(clientIP, clientPort)
 
-	span.End()
-	stats.Record(statsCtx, MetricsAPITimeSpentMsec.M(float64(time.Now().UTC().UnixNano()-startNanos)/1e6), MetricsAPICount.M(1))
+	metrics.ApiBefore(fullMethodName, time.Since(start), err != nil)
 
 	return err
 }
 
-func traceApiAfter(ctx context.Context, logger *zap.Logger, fullMethodName string, fn func(clientIP, clientPort string)) {
-	name := fmt.Sprintf("%v-after", logger)
+func traceApiAfter(ctx context.Context, logger *zap.Logger, metrics *Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) {
 	clientIP, clientPort := extractClientAddressFromContext(logger, ctx)
-	statsCtx, err := tag.New(ctx, tag.Upsert(MetricsFunction, name))
-	if err != nil {
-		// If there was an error processing the stats, just execute the function.
-		logger.Warn("Error tagging API after stats", zap.String("full_method_name", fullMethodName), zap.Error(err))
-		fn(clientIP, clientPort)
-		return
-	}
-	startNanos := time.Now().UTC().UnixNano()
-	statsCtx, span := trace.StartSpan(statsCtx, name)
+	start := time.Now()
 
-	fn(clientIP, clientPort)
+	// Execute the after hook itself.
+	err := fn(clientIP, clientPort)
 
-	span.End()
-	stats.Record(statsCtx, MetricsAPITimeSpentMsec.M(float64(time.Now().UTC().UnixNano()-startNanos)/1e6), MetricsAPICount.M(1))
+	metrics.ApiAfter(fullMethodName, time.Since(start), err != nil)
 }
