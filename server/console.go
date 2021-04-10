@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -27,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/dgrijalva/jwt-go"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/gorilla/handlers"
@@ -65,6 +66,7 @@ type ConsoleServer struct {
 	config               Config
 	tracker              Tracker
 	router               MessageRouter
+	sessionCache         SessionCache
 	matchRegistry        MatchRegistry
 	statusHandler        StatusHandler
 	runtimeInfo          *RuntimeInfo
@@ -81,7 +83,7 @@ type ConsoleServer struct {
 	httpClient           *http.Client
 }
 
-func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, config Config, tracker Tracker, router MessageRouter, statusHandler StatusHandler, runtimeInfo *RuntimeInfo, matchRegistry MatchRegistry, configWarnings map[string]string, serverVersion string, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, api *ApiServer, cookie string) *ConsoleServer {
+func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, config Config, tracker Tracker, router MessageRouter, sessionCache SessionCache, statusHandler StatusHandler, runtimeInfo *RuntimeInfo, matchRegistry MatchRegistry, configWarnings map[string]string, serverVersion string, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, api *ApiServer, cookie string) *ConsoleServer {
 	var gatewayContextTimeoutMs string
 	if config.GetConsole().IdleTimeoutMs > 500 {
 		// Ensure the GRPC Gateway timeout is just under the idle timeout (if possible) to ensure it has priority.
@@ -105,6 +107,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 		config:               config,
 		tracker:              tracker,
 		router:               router,
+		sessionCache:         sessionCache,
 		matchRegistry:        matchRegistry,
 		statusHandler:        statusHandler,
 		configWarnings:       configWarnings,
@@ -158,7 +161,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 	dialOpts := []grpc.DialOption{
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallSendMsgSize(int(config.GetConsole().MaxMessageSizeBytes)),
-			grpc.MaxCallRecvMsgSize(int(config.GetConsole().MaxMessageSizeBytes)),
+			grpc.MaxCallRecvMsgSize(math.MaxInt32),
 		),
 		grpc.WithInsecure(),
 	}

@@ -25,6 +25,8 @@ type NakamaClient interface {
 	AddGroupUsers(ctx context.Context, in *api.AddGroupUsersRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Refresh a user's session using a refresh token retrieved from a previous authentication request.
 	SessionRefresh(ctx context.Context, in *api.SessionRefreshRequest, opts ...grpc.CallOption) (*api.Session, error)
+	// Log out a session, invalidate a refresh token, or log out all sessions/refresh tokens for a user.
+	SessionLogout(ctx context.Context, in *api.SessionLogoutRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Authenticate a user with an Apple ID against the server.
 	AuthenticateApple(ctx context.Context, in *api.AuthenticateAppleRequest, opts ...grpc.CallOption) (*api.Session, error)
 	// Authenticate a user with a custom id against the server.
@@ -153,6 +155,12 @@ type NakamaClient interface {
 	UpdateAccount(ctx context.Context, in *api.UpdateAccountRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Update fields in a given group.
 	UpdateGroup(ctx context.Context, in *api.UpdateGroupRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Validate Apple IAP Receipt
+	ValidatePurchaseApple(ctx context.Context, in *api.ValidatePurchaseAppleRequest, opts ...grpc.CallOption) (*api.ValidatePurchaseResponse, error)
+	// Validate Google IAP Receipt
+	ValidatePurchaseGoogle(ctx context.Context, in *api.ValidatePurchaseGoogleRequest, opts ...grpc.CallOption) (*api.ValidatePurchaseResponse, error)
+	// Validate Huawei IAP Receipt
+	ValidatePurchaseHuawei(ctx context.Context, in *api.ValidatePurchaseHuaweiRequest, opts ...grpc.CallOption) (*api.ValidatePurchaseResponse, error)
 	// Write a record to a leaderboard.
 	WriteLeaderboardRecord(ctx context.Context, in *api.WriteLeaderboardRecordRequest, opts ...grpc.CallOption) (*api.LeaderboardRecord, error)
 	// Write objects into the storage engine.
@@ -190,6 +198,15 @@ func (c *nakamaClient) AddGroupUsers(ctx context.Context, in *api.AddGroupUsersR
 func (c *nakamaClient) SessionRefresh(ctx context.Context, in *api.SessionRefreshRequest, opts ...grpc.CallOption) (*api.Session, error) {
 	out := new(api.Session)
 	err := c.cc.Invoke(ctx, "/nakama.api.Nakama/SessionRefresh", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nakamaClient) SessionLogout(ctx context.Context, in *api.SessionLogoutRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/nakama.api.Nakama/SessionLogout", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -772,6 +789,33 @@ func (c *nakamaClient) UpdateGroup(ctx context.Context, in *api.UpdateGroupReque
 	return out, nil
 }
 
+func (c *nakamaClient) ValidatePurchaseApple(ctx context.Context, in *api.ValidatePurchaseAppleRequest, opts ...grpc.CallOption) (*api.ValidatePurchaseResponse, error) {
+	out := new(api.ValidatePurchaseResponse)
+	err := c.cc.Invoke(ctx, "/nakama.api.Nakama/ValidatePurchaseApple", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nakamaClient) ValidatePurchaseGoogle(ctx context.Context, in *api.ValidatePurchaseGoogleRequest, opts ...grpc.CallOption) (*api.ValidatePurchaseResponse, error) {
+	out := new(api.ValidatePurchaseResponse)
+	err := c.cc.Invoke(ctx, "/nakama.api.Nakama/ValidatePurchaseGoogle", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nakamaClient) ValidatePurchaseHuawei(ctx context.Context, in *api.ValidatePurchaseHuaweiRequest, opts ...grpc.CallOption) (*api.ValidatePurchaseResponse, error) {
+	out := new(api.ValidatePurchaseResponse)
+	err := c.cc.Invoke(ctx, "/nakama.api.Nakama/ValidatePurchaseHuawei", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *nakamaClient) WriteLeaderboardRecord(ctx context.Context, in *api.WriteLeaderboardRecordRequest, opts ...grpc.CallOption) (*api.LeaderboardRecord, error) {
 	out := new(api.LeaderboardRecord)
 	err := c.cc.Invoke(ctx, "/nakama.api.Nakama/WriteLeaderboardRecord", in, out, opts...)
@@ -809,6 +853,8 @@ type NakamaServer interface {
 	AddGroupUsers(context.Context, *api.AddGroupUsersRequest) (*emptypb.Empty, error)
 	// Refresh a user's session using a refresh token retrieved from a previous authentication request.
 	SessionRefresh(context.Context, *api.SessionRefreshRequest) (*api.Session, error)
+	// Log out a session, invalidate a refresh token, or log out all sessions/refresh tokens for a user.
+	SessionLogout(context.Context, *api.SessionLogoutRequest) (*emptypb.Empty, error)
 	// Authenticate a user with an Apple ID against the server.
 	AuthenticateApple(context.Context, *api.AuthenticateAppleRequest) (*api.Session, error)
 	// Authenticate a user with a custom id against the server.
@@ -937,6 +983,12 @@ type NakamaServer interface {
 	UpdateAccount(context.Context, *api.UpdateAccountRequest) (*emptypb.Empty, error)
 	// Update fields in a given group.
 	UpdateGroup(context.Context, *api.UpdateGroupRequest) (*emptypb.Empty, error)
+	// Validate Apple IAP Receipt
+	ValidatePurchaseApple(context.Context, *api.ValidatePurchaseAppleRequest) (*api.ValidatePurchaseResponse, error)
+	// Validate Google IAP Receipt
+	ValidatePurchaseGoogle(context.Context, *api.ValidatePurchaseGoogleRequest) (*api.ValidatePurchaseResponse, error)
+	// Validate Huawei IAP Receipt
+	ValidatePurchaseHuawei(context.Context, *api.ValidatePurchaseHuaweiRequest) (*api.ValidatePurchaseResponse, error)
 	// Write a record to a leaderboard.
 	WriteLeaderboardRecord(context.Context, *api.WriteLeaderboardRecordRequest) (*api.LeaderboardRecord, error)
 	// Write objects into the storage engine.
@@ -958,6 +1010,9 @@ func (UnimplementedNakamaServer) AddGroupUsers(context.Context, *api.AddGroupUse
 }
 func (UnimplementedNakamaServer) SessionRefresh(context.Context, *api.SessionRefreshRequest) (*api.Session, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SessionRefresh not implemented")
+}
+func (UnimplementedNakamaServer) SessionLogout(context.Context, *api.SessionLogoutRequest) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SessionLogout not implemented")
 }
 func (UnimplementedNakamaServer) AuthenticateApple(context.Context, *api.AuthenticateAppleRequest) (*api.Session, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AuthenticateApple not implemented")
@@ -1151,6 +1206,15 @@ func (UnimplementedNakamaServer) UpdateAccount(context.Context, *api.UpdateAccou
 func (UnimplementedNakamaServer) UpdateGroup(context.Context, *api.UpdateGroupRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdateGroup not implemented")
 }
+func (UnimplementedNakamaServer) ValidatePurchaseApple(context.Context, *api.ValidatePurchaseAppleRequest) (*api.ValidatePurchaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ValidatePurchaseApple not implemented")
+}
+func (UnimplementedNakamaServer) ValidatePurchaseGoogle(context.Context, *api.ValidatePurchaseGoogleRequest) (*api.ValidatePurchaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ValidatePurchaseGoogle not implemented")
+}
+func (UnimplementedNakamaServer) ValidatePurchaseHuawei(context.Context, *api.ValidatePurchaseHuaweiRequest) (*api.ValidatePurchaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ValidatePurchaseHuawei not implemented")
+}
 func (UnimplementedNakamaServer) WriteLeaderboardRecord(context.Context, *api.WriteLeaderboardRecordRequest) (*api.LeaderboardRecord, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method WriteLeaderboardRecord not implemented")
 }
@@ -1223,6 +1287,24 @@ func _Nakama_SessionRefresh_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(NakamaServer).SessionRefresh(ctx, req.(*api.SessionRefreshRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Nakama_SessionLogout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(api.SessionLogoutRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NakamaServer).SessionLogout(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/nakama.api.Nakama/SessionLogout",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NakamaServer).SessionLogout(ctx, req.(*api.SessionLogoutRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2379,6 +2461,60 @@ func _Nakama_UpdateGroup_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Nakama_ValidatePurchaseApple_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(api.ValidatePurchaseAppleRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NakamaServer).ValidatePurchaseApple(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/nakama.api.Nakama/ValidatePurchaseApple",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NakamaServer).ValidatePurchaseApple(ctx, req.(*api.ValidatePurchaseAppleRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Nakama_ValidatePurchaseGoogle_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(api.ValidatePurchaseGoogleRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NakamaServer).ValidatePurchaseGoogle(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/nakama.api.Nakama/ValidatePurchaseGoogle",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NakamaServer).ValidatePurchaseGoogle(ctx, req.(*api.ValidatePurchaseGoogleRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Nakama_ValidatePurchaseHuawei_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(api.ValidatePurchaseHuaweiRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NakamaServer).ValidatePurchaseHuawei(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/nakama.api.Nakama/ValidatePurchaseHuawei",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NakamaServer).ValidatePurchaseHuawei(ctx, req.(*api.ValidatePurchaseHuaweiRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Nakama_WriteLeaderboardRecord_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(api.WriteLeaderboardRecordRequest)
 	if err := dec(in); err != nil {
@@ -2448,6 +2584,10 @@ var _Nakama_serviceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SessionRefresh",
 			Handler:    _Nakama_SessionRefresh_Handler,
+		},
+		{
+			MethodName: "SessionLogout",
+			Handler:    _Nakama_SessionLogout_Handler,
 		},
 		{
 			MethodName: "AuthenticateApple",
@@ -2704,6 +2844,18 @@ var _Nakama_serviceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateGroup",
 			Handler:    _Nakama_UpdateGroup_Handler,
+		},
+		{
+			MethodName: "ValidatePurchaseApple",
+			Handler:    _Nakama_ValidatePurchaseApple_Handler,
+		},
+		{
+			MethodName: "ValidatePurchaseGoogle",
+			Handler:    _Nakama_ValidatePurchaseGoogle_Handler,
+		},
+		{
+			MethodName: "ValidatePurchaseHuawei",
+			Handler:    _Nakama_ValidatePurchaseHuawei_Handler,
 		},
 		{
 			MethodName: "WriteLeaderboardRecord",

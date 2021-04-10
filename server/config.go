@@ -15,19 +15,17 @@
 package server
 
 import (
+	"crypto/tls"
+	"flag"
 	"fmt"
+	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
-	"flag"
-	"io/ioutil"
-
 	"github.com/heroiclabs/nakama/v3/flags"
-
-	"crypto/tls"
-
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v2"
 )
@@ -49,6 +47,7 @@ type Config interface {
 	GetConsole() *ConsoleConfig
 	GetLeaderboard() *LeaderboardConfig
 	GetMatchmaker() *MatchmakerConfig
+	GetIAP() *IAPConfig
 
 	Clone() (Config, error)
 }
@@ -107,6 +106,7 @@ func ParseArgs(logger *zap.Logger, args []string) Config {
 	for k, v := range mainConfig.GetRuntime().Environment {
 		mainConfig.GetRuntime().Env = append(mainConfig.GetRuntime().Env, fmt.Sprintf("%v=%v", k, v))
 	}
+	sort.Strings(mainConfig.GetRuntime().Env)
 
 	return mainConfig
 }
@@ -166,6 +166,9 @@ func CheckConfig(logger *zap.Logger, config Config) map[string]string {
 	}
 	if config.GetSocket().MaxMessageSizeBytes < 1 {
 		logger.Fatal("Socket max message size bytes must be >= 1", zap.Int64("socket.max_message_size_bytes", config.GetSocket().MaxMessageSizeBytes))
+	}
+	if config.GetSocket().MaxRequestSizeBytes < 1 {
+		logger.Fatal("Socket max request size bytes must be >= 1", zap.Int64("socket.max_request_size_bytes", config.GetSocket().MaxRequestSizeBytes))
 	}
 	if config.GetSocket().ReadBufferSizeBytes < 1 {
 		logger.Fatal("Socket read buffer size bytes must be >= 1", zap.Int("socket.read_buffer_size_bytes", config.GetSocket().ReadBufferSizeBytes))
@@ -263,6 +266,9 @@ func CheckConfig(logger *zap.Logger, config Config) map[string]string {
 	if config.GetMatchmaker().MaxIntervals < 1 {
 		logger.Fatal("Matchmaker max intervals must be >= 1", zap.Int("matchmaker.max_intervals", config.GetMatchmaker().MaxIntervals))
 	}
+	if config.GetMatchmaker().BatchPoolSize < 1 {
+		logger.Fatal("Matchmaker batch pool size must be >= 1", zap.Int("matchmaker.batch_pool_size", config.GetMatchmaker().BatchPoolSize))
+	}
 
 	// If the runtime path is not overridden, set it to `datadir/modules`.
 	if config.GetRuntime().Path == "" {
@@ -342,11 +348,6 @@ func CheckConfig(logger *zap.Logger, config Config) map[string]string {
 		config.GetSocket().TLSCert = []tls.Certificate{cert}
 	}
 
-	// Set backwards-compatible defaults if overrides are not used.
-	if config.GetSocket().MaxRequestSizeBytes <= 0 {
-		config.GetSocket().MaxRequestSizeBytes = config.GetSocket().MaxMessageSizeBytes
-	}
-
 	return configWarnings
 }
 
@@ -388,6 +389,7 @@ type config struct {
 	Console          *ConsoleConfig     `yaml:"console" json:"console" usage:"Console settings."`
 	Leaderboard      *LeaderboardConfig `yaml:"leaderboard" json:"leaderboard" usage:"Leaderboard settings."`
 	Matchmaker       *MatchmakerConfig  `yaml:"matchmaker" json:"matchmaker" usage:"Matchmaker settings."`
+	IAP              *IAPConfig         `yaml:"iap" json:"iap" usage:"In-App Purchase settings."`
 }
 
 // NewConfig constructs a Config struct which represents server settings, and populates it with default values.
@@ -412,6 +414,7 @@ func NewConfig(logger *zap.Logger) *config {
 		Console:          NewConsoleConfig(),
 		Leaderboard:      NewLeaderboardConfig(),
 		Matchmaker:       NewMatchmakerConfig(),
+		IAP:              NewIAPConfig(),
 	}
 }
 
@@ -530,6 +533,10 @@ func (c *config) GetMatchmaker() *MatchmakerConfig {
 	return c.Matchmaker
 }
 
+func (c *config) GetIAP() *IAPConfig {
+	return c.IAP
+}
+
 // LoggerConfig is configuration relevant to logging levels and output.
 type LoggerConfig struct {
 	Level    string `yaml:"level" json:"level" usage:"Log level to set. Valid values are 'debug', 'info', 'warn', 'error'. Default 'info'."`
@@ -630,7 +637,7 @@ func NewSocketConfig() *SocketConfig {
 		Address:              "",
 		Protocol:             "tcp",
 		MaxMessageSizeBytes:  4096,
-		MaxRequestSizeBytes:  0,
+		MaxRequestSizeBytes:  262_144, // 256 KB.
 		ReadBufferSizeBytes:  4096,
 		WriteBufferSizeBytes: 4096,
 		ReadTimeoutMs:        10 * 1000,
@@ -666,9 +673,10 @@ func NewDatabaseConfig() *DatabaseConfig {
 
 // SocialConfig is configuration relevant to the social authentication providers.
 type SocialConfig struct {
-	Steam               *SocialConfigSteam               `yaml:"steam" json:"steam" usage:"Steam configuration."`
-	FacebookInstantGame *SocialConfigFacebookInstantGame `yaml:"facebook_instant_game" json:"facebook_instant_game" usage:"Facebook Instant Game configuration"`
-	Apple               *SocialConfigApple               `yaml:"apple" json:"apple" usage:"Apple Sign In configuration."`
+	Steam                *SocialConfigSteam                `yaml:"steam" json:"steam" usage:"Steam configuration."`
+	FacebookInstantGame  *SocialConfigFacebookInstantGame  `yaml:"facebook_instant_game" json:"facebook_instant_game" usage:"Facebook Instant Game configuration."`
+	FacebookLimitedLogin *SocialConfigFacebookLimitedLogin `yaml:"facebook_limited_login" json:"facebook_limited_login" usage:"Facebook Limited Login configuration."`
+	Apple                *SocialConfigApple                `yaml:"apple" json:"apple" usage:"Apple Sign In configuration."`
 }
 
 // SocialConfigSteam is configuration relevant to Steam.
@@ -680,6 +688,11 @@ type SocialConfigSteam struct {
 // SocialConfigFacebookInstantGame is configuration relevant to Facebook Instant Games.
 type SocialConfigFacebookInstantGame struct {
 	AppSecret string `yaml:"app_secret" json:"app_secret" usage:"Facebook Instant App secret."`
+}
+
+// SocialConfigFacebookLimitedLogin is configuration relevant to Facebook Limited Login.
+type SocialConfigFacebookLimitedLogin struct {
+	AppId string `yaml:"app_id" json:"app_id" usage:"Facebook Limited Login App ID."`
 }
 
 // SocialConfigApple is configuration relevant to Apple Sign In.
@@ -696,6 +709,9 @@ func NewSocialConfig() *SocialConfig {
 		},
 		FacebookInstantGame: &SocialConfigFacebookInstantGame{
 			AppSecret: "",
+		},
+		FacebookLimitedLogin: &SocialConfigFacebookLimitedLogin{
+			AppId: "",
 		},
 		Apple: &SocialConfigApple{
 			BundleId: "",
@@ -840,7 +856,7 @@ type ConsoleConfig struct {
 func NewConsoleConfig() *ConsoleConfig {
 	return &ConsoleConfig{
 		Port:                7351,
-		MaxMessageSizeBytes: 4096,
+		MaxMessageSizeBytes: 4_194_304, // 4 MB.
 		ReadTimeoutMs:       10 * 1000,
 		WriteTimeoutMs:      60 * 1000,
 		IdleTimeoutMs:       300 * 1000,
@@ -868,15 +884,46 @@ func NewLeaderboardConfig() *LeaderboardConfig {
 }
 
 type MatchmakerConfig struct {
-	MaxTickets   int `yaml:"max_tickets" json:"max_tickets" usage:"Maximum number of concurrent matchmaking tickets allowed per session or party. Default 3."`
-	IntervalSec  int `yaml:"interval_sec" json:"interval_sec" usage:"How quickly the matchmaker attempts to form matches, in seconds. Default 15."`
-	MaxIntervals int `yaml:"max_intervals" json:"max_intervals" usage:"How many intervals the matchmaker attempts to find matches at the max player count, before allowing min count. Default 2."`
+	MaxTickets    int `yaml:"max_tickets" json:"max_tickets" usage:"Maximum number of concurrent matchmaking tickets allowed per session or party. Default 3."`
+	IntervalSec   int `yaml:"interval_sec" json:"interval_sec" usage:"How quickly the matchmaker attempts to form matches, in seconds. Default 15."`
+	MaxIntervals  int `yaml:"max_intervals" json:"max_intervals" usage:"How many intervals the matchmaker attempts to find matches at the max player count, before allowing min count. Default 2."`
+	BatchPoolSize int `yaml:"batch_pool_size" json:"batch_pool_size" usage:"Number of concurrent indexing batches that will be allocated."`
 }
 
 func NewMatchmakerConfig() *MatchmakerConfig {
 	return &MatchmakerConfig{
-		MaxTickets:   3,
-		IntervalSec:  15,
-		MaxIntervals: 2,
+		MaxTickets:    3,
+		IntervalSec:   15,
+		MaxIntervals:  2,
+		BatchPoolSize: 32,
 	}
+}
+
+type IAPConfig struct {
+	Apple  *IAPAppleConfig
+	Google *IAPGoogleConfig
+	Huawei *IAPHuaweiConfig
+}
+
+func NewIAPConfig() *IAPConfig {
+	return &IAPConfig{
+		Apple:  &IAPAppleConfig{},
+		Google: &IAPGoogleConfig{},
+		Huawei: &IAPHuaweiConfig{},
+	}
+}
+
+type IAPAppleConfig struct {
+	SharedPassword string `yaml:"shared_password" json:"shared_password" usage:"Your Apple Store App IAP shared password. Only necessary for validation of auto-renewable subscriptions."`
+}
+
+type IAPGoogleConfig struct {
+	ClientEmail string `yaml:"client_email" json:"client_email" usage:"Google Service Account client email."`
+	PrivateKey  string `yaml:"private_key" json:"private_key" usage:"Google Service Account private key."`
+}
+
+type IAPHuaweiConfig struct {
+	PublicKey    string `yaml:"public_key" json:"public_key" usage:"Huawei IAP store Base64 encoded Public Key."`
+	ClientID     string `yaml:"client_id" json:"client_id" usage:"Huawei OAuth client secret."`
+	ClientSecret string `yaml:"client_secret" json:"client_secret" usage:"Huawei OAuth app client secret."`
 }
