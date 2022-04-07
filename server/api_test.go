@@ -15,40 +15,39 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"strings"
+	"testing"
+
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/jsonpb"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/apigrpc"
-	_ "github.com/jackc/pgx/stdlib"
+	_ "github.com/jackc/pgx/v4/stdlib"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
-	"os"
-	"strings"
-	"testing"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 var (
-	logger          = NewConsoleLogger(os.Stdout, true)
-	cfg             = NewConfig(logger)
-	jsonpbMarshaler = &jsonpb.Marshaler{
-		EnumsAsInts:  true,
-		EmitDefaults: false,
-		Indent:       "",
-		OrigName:     true,
+	logger             = NewConsoleLogger(os.Stdout, true)
+	cfg                = NewConfig(logger)
+	protojsonMarshaler = &protojson.MarshalOptions{
+		UseProtoNames:   true,
+		UseEnumNumbers:  true,
+		EmitUnpopulated: false,
 	}
-	jsonpbUnmarshaler = &jsonpb.Unmarshaler{
-		AllowUnknownFields: false,
+	protojsonUnmarshaler = &protojson.UnmarshalOptions{
+		DiscardUnknown: false,
 	}
-	metrics = NewMetrics(logger, logger, cfg)
+	metrics = NewLocalMetrics(logger, logger, nil, cfg)
 	_       = CheckConfig(logger, cfg)
 )
 
@@ -95,6 +94,9 @@ func (d *DummySession) ClientIP() string {
 func (d *DummySession) ClientPort() string {
 	return ""
 }
+func (d *DummySession) Lang() string {
+	return ""
+}
 func (d *DummySession) Context() context.Context {
 	return context.Background()
 }
@@ -104,12 +106,15 @@ func (d *DummySession) Send(envelope *rtapi.Envelope, reliable bool) error {
 }
 func (d *DummySession) SendBytes(payload []byte, reliable bool) error {
 	envelope := &rtapi.Envelope{}
-	jsonpbUnmarshaler.Unmarshal(bytes.NewReader(payload), envelope)
+	if err := protojsonUnmarshaler.Unmarshal(payload, envelope); err != nil {
+		return err
+	}
 	d.messages = append(d.messages, envelope)
 	return nil
 }
 
-func (d *DummySession) Close(msg string, reason runtime.PresenceReason) {}
+func (d *DummySession) Close(msg string, reason runtime.PresenceReason, envelopes ...*rtapi.Envelope) {
+}
 
 type loggerEnabler struct{}
 
@@ -167,8 +172,8 @@ func NewAPIServer(t *testing.T, runtime *Runtime) (*ApiServer, *Pipeline) {
 	db := NewDB(t)
 	router := &DummyMessageRouter{}
 	tracker := &LocalTracker{}
-	pipeline := NewPipeline(logger, cfg, db, jsonpbMarshaler, jsonpbUnmarshaler, nil, nil, nil, nil, nil, tracker, router, runtime)
-	apiServer := StartApiServer(logger, logger, db, jsonpbMarshaler, jsonpbUnmarshaler, cfg, nil, nil, nil, nil, nil, nil, nil, nil, tracker, router, metrics, pipeline, runtime)
+	pipeline := NewPipeline(logger, cfg, db, protojsonMarshaler, protojsonUnmarshaler, nil, nil, nil, nil, nil, tracker, router, runtime)
+	apiServer := StartApiServer(logger, logger, db, protojsonMarshaler, protojsonUnmarshaler, cfg, nil, nil, nil, nil, nil, nil, nil, nil, tracker, router, metrics, pipeline, runtime)
 	return apiServer, pipeline
 }
 

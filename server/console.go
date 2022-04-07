@@ -28,19 +28,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
-	"google.golang.org/protobuf/encoding/protojson"
-
+	jwt "github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	grpcgw "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/heroiclabs/nakama/v3/console"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-
-	"github.com/heroiclabs/nakama/v3/console"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 var restrictedMethods = map[string]console.UserRole{
@@ -48,6 +46,7 @@ var restrictedMethods = map[string]console.UserRole{
 	"/nakama.console.Console/CreateUser":        console.UserRole_USER_ROLE_ADMIN,
 	"/nakama.console.Console/DeleteUser":        console.UserRole_USER_ROLE_ADMIN,
 	"/nakama.console.Console/DeleteAccounts":    console.UserRole_USER_ROLE_DEVELOPER, // only developer or admin can call this method
+	"/nakama.console.Console/DeleteAllData":     console.UserRole_USER_ROLE_DEVELOPER, // only developer or admin can call this method
 	"/nakama.console.Console/CallApiEndpoint":   console.UserRole_USER_ROLE_DEVELOPER, // only developer or admin can call this method
 	"/nakama.console.Console/ListApiEndpoints":  console.UserRole_USER_ROLE_DEVELOPER, // only developer or admin can call this method
 	"/nakama.console.Console/GetRuntime":        console.UserRole_USER_ROLE_DEVELOPER,
@@ -140,6 +139,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 	}()
 
 	grpcGateway := grpcgw.NewServeMux(
+		grpcgw.WithUnescapingMode(grpcgw.UnescapingModeAllExceptReserved),
 		grpcgw.WithMarshalerOption(grpcgw.MIMEWildcard, &grpcgw.HTTPBodyMarshaler{
 			Marshaler: &grpcgw.JSONPb{
 				MarshalOptions: protojson.MarshalOptions{
@@ -235,7 +235,16 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 
 			// Load all distinct collections from database.
 			collections := make([]string, 0, 10)
-			query := "SELECT DISTINCT collection FROM storage"
+
+			query := `
+WITH RECURSIVE t AS (
+   (SELECT collection FROM storage ORDER BY collection LIMIT 1)  -- Parentheses required, do not remove.
+   UNION ALL
+   SELECT (SELECT collection FROM storage WHERE collection > t.collection ORDER BY collection LIMIT 1)
+   FROM t
+   WHERE t.collection IS NOT NULL
+   )
+SELECT collection FROM t WHERE collection IS NOT NULL`
 			rows, err := s.db.QueryContext(ctx, query)
 			if err != nil {
 				s.logger.Error("Error querying storage collections.", zap.Error(err))
@@ -326,7 +335,7 @@ func (s *ConsoleServer) Stop() {
 	s.ctxCancelFn()
 	// 1. Stop GRPC Gateway server first as it sits above GRPC server.
 	if err := s.grpcGatewayServer.Shutdown(context.Background()); err != nil {
-		s.logger.Error("API server gateway listener shutdown failed", zap.Error(err))
+		s.logger.Error("Console server gateway listener shutdown failed", zap.Error(err))
 	}
 	// 2. Stop GRPC server.
 	s.grpcServer.GracefulStop()

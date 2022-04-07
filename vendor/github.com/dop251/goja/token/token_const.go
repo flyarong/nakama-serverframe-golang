@@ -6,13 +6,9 @@ const (
 	ILLEGAL
 	EOF
 	COMMENT
-	KEYWORD
 
 	STRING
-	BOOLEAN
-	NULL
 	NUMBER
-	IDENTIFIER
 
 	PLUS      // +
 	MINUS     // -
@@ -71,14 +67,25 @@ const (
 	SEMICOLON         // ;
 	COLON             // :
 	QUESTION_MARK     // ?
+	QUESTION_DOT      // ?.
+	ARROW             // =>
+	ELLIPSIS          // ...
+	BACKTICK          // `
 
-	firstKeyword
+	// tokens below (and only them) are syntactically valid identifiers
+
+	IDENTIFIER
+	KEYWORD
+	BOOLEAN
+	NULL
+
 	IF
 	IN
 	OF
 	DO
 
 	VAR
+	LET
 	FOR
 	NEW
 	TRY
@@ -89,6 +96,7 @@ const (
 	VOID
 	WITH
 
+	CONST
 	WHILE
 	BREAK
 	CATCH
@@ -107,7 +115,6 @@ const (
 	DEBUGGER
 
 	INSTANCEOF
-	lastKeyword
 )
 
 var token2string = [...]string{
@@ -168,11 +175,16 @@ var token2string = [...]string{
 	SEMICOLON:                   ";",
 	COLON:                       ":",
 	QUESTION_MARK:               "?",
+	QUESTION_DOT:                "?.",
+	ARROW:                       "=>",
+	ELLIPSIS:                    "...",
+	BACKTICK:                    "`",
 	IF:                          "if",
 	IN:                          "in",
 	OF:                          "of",
 	DO:                          "do",
 	VAR:                         "var",
+	LET:                         "let",
 	FOR:                         "for",
 	NEW:                         "new",
 	TRY:                         "try",
@@ -181,6 +193,7 @@ var token2string = [...]string{
 	CASE:                        "case",
 	VOID:                        "void",
 	WITH:                        "with",
+	CONST:                       "const",
 	WHILE:                       "while",
 	BREAK:                       "break",
 	CATCH:                       "catch",
@@ -277,8 +290,7 @@ var keywordTable = map[string]_keyword{
 		token: INSTANCEOF,
 	},
 	"const": {
-		token:         KEYWORD,
-		futureKeyword: true,
+		token: CONST,
 	},
 	"class": {
 		token:         KEYWORD,
@@ -315,9 +327,8 @@ var keywordTable = map[string]_keyword{
 		strict:        true,
 	},
 	"let": {
-		token:         KEYWORD,
-		futureKeyword: true,
-		strict:        true,
+		token:  LET,
+		strict: true,
 	},
 	"package": {
 		token:         KEYWORD,

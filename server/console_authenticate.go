@@ -16,21 +16,19 @@ package server
 
 import (
 	"context"
-
 	"crypto"
 	"database/sql"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/pgtype"
+	jwt "github.com/golang-jwt/jwt/v4"
+	"github.com/heroiclabs/nakama/v3/console"
+	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	"github.com/dgrijalva/jwt-go"
-	"github.com/heroiclabs/nakama/v3/console"
 )
 
 type ConsoleTokenClaims struct {
@@ -88,7 +86,7 @@ func (s *ConsoleServer) Authenticate(ctx context.Context, in *console.Authentica
 	}
 
 	if role == console.UserRole_USER_ROLE_UNKNOWN {
-		return nil, status.Error(codes.Unauthenticated, "Invalid Nakama Console credentials.")
+		return nil, status.Error(codes.Unauthenticated, "Invalid credentials.")
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, &ConsoleTokenClaims{
@@ -119,7 +117,7 @@ func (s *ConsoleServer) lookupConsoleUser(ctx context.Context, unameOrEmail, pas
 	// Check if it's disabled.
 	if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
 		s.logger.Info("Console user account is disabled.", zap.String("username", unameOrEmail))
-		err = status.Error(codes.PermissionDenied, "Console user account banned.")
+		err = status.Error(codes.PermissionDenied, "Invalid credentials.")
 		return
 	}
 

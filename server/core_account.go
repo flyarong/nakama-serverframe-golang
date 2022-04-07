@@ -18,19 +18,20 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"strconv"
+	"strings"
+
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/timestamp"
-	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
-	"github.com/jackc/pgx"
-	"github.com/jackc/pgx/pgtype"
-	"github.com/pkg/errors"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"strconv"
-	"strings"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 var ErrAccountNotFound = errors.New("account not found")
@@ -39,12 +40,12 @@ var ErrAccountNotFound = errors.New("account not found")
 type accountUpdate struct {
 	userID      uuid.UUID
 	username    string
-	displayName *wrappers.StringValue
-	timezone    *wrappers.StringValue
-	location    *wrappers.StringValue
-	langTag     *wrappers.StringValue
-	avatarURL   *wrappers.StringValue
-	metadata    *wrappers.StringValue
+	displayName *wrapperspb.StringValue
+	timezone    *wrapperspb.StringValue
+	location    *wrapperspb.StringValue
+	langTag     *wrapperspb.StringValue
+	avatarURL   *wrapperspb.StringValue
+	metadata    *wrapperspb.StringValue
 }
 
 func GetAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, userID uuid.UUID) (*api.Account, error) {
@@ -91,18 +92,18 @@ WHERE u.id = $1`
 		devices = append(devices, &api.AccountDevice{Id: deviceID.String})
 	}
 
-	var verifyTimestamp *timestamp.Timestamp
+	var verifyTimestamp *timestamppb.Timestamp
 	if verifyTime.Status == pgtype.Present && verifyTime.Time.Unix() != 0 {
-		verifyTimestamp = &timestamp.Timestamp{Seconds: verifyTime.Time.Unix()}
+		verifyTimestamp = &timestamppb.Timestamp{Seconds: verifyTime.Time.Unix()}
 	}
-	var disableTimestamp *timestamp.Timestamp
+	var disableTimestamp *timestamppb.Timestamp
 	if disableTime.Status == pgtype.Present && disableTime.Time.Unix() != 0 {
-		disableTimestamp = &timestamp.Timestamp{Seconds: disableTime.Time.Unix()}
+		disableTimestamp = &timestamppb.Timestamp{Seconds: disableTime.Time.Unix()}
 	}
 
 	online := false
 	if tracker != nil {
-		online = tracker.StreamExists(PresenceStream{Mode: StreamModeNotifications, Subject: userID})
+		online = tracker.StreamExists(PresenceStream{Mode: StreamModeStatus, Subject: userID})
 	}
 
 	return &api.Account{
@@ -122,8 +123,8 @@ WHERE u.id = $1`
 			GamecenterId:          gamecenter.String,
 			SteamId:               steam.String,
 			EdgeCount:             int32(edgeCount),
-			CreateTime:            &timestamp.Timestamp{Seconds: createTime.Time.Unix()},
-			UpdateTime:            &timestamp.Timestamp{Seconds: updateTime.Time.Unix()},
+			CreateTime:            &timestamppb.Timestamp{Seconds: createTime.Time.Unix()},
+			UpdateTime:            &timestamppb.Timestamp{Seconds: updateTime.Time.Unix()},
 			Online:                online,
 		},
 		Wallet:      wallet.String,
@@ -193,18 +194,18 @@ WHERE u.id IN (` + strings.Join(statements, ",") + `)`
 			devices = append(devices, &api.AccountDevice{Id: deviceID.String})
 		}
 
-		var verifyTimestamp *timestamp.Timestamp
+		var verifyTimestamp *timestamppb.Timestamp
 		if verifyTime.Status == pgtype.Present && verifyTime.Time.Unix() != 0 {
-			verifyTimestamp = &timestamp.Timestamp{Seconds: verifyTime.Time.Unix()}
+			verifyTimestamp = &timestamppb.Timestamp{Seconds: verifyTime.Time.Unix()}
 		}
-		var disableTimestamp *timestamp.Timestamp
+		var disableTimestamp *timestamppb.Timestamp
 		if disableTime.Status == pgtype.Present && disableTime.Time.Unix() != 0 {
-			disableTimestamp = &timestamp.Timestamp{Seconds: disableTime.Time.Unix()}
+			disableTimestamp = &timestamppb.Timestamp{Seconds: disableTime.Time.Unix()}
 		}
 
 		online := false
 		if tracker != nil {
-			online = tracker.StreamExists(PresenceStream{Mode: StreamModeNotifications, Subject: uuid.FromStringOrNil(userID)})
+			online = tracker.StreamExists(PresenceStream{Mode: StreamModeStatus, Subject: uuid.FromStringOrNil(userID)})
 		}
 
 		accounts = append(accounts, &api.Account{
@@ -224,8 +225,8 @@ WHERE u.id IN (` + strings.Join(statements, ",") + `)`
 				GamecenterId:          gamecenter.String,
 				SteamId:               steam.String,
 				EdgeCount:             int32(edgeCount),
-				CreateTime:            &timestamp.Timestamp{Seconds: createTime.Time.Unix()},
-				UpdateTime:            &timestamp.Timestamp{Seconds: updateTime.Time.Unix()},
+				CreateTime:            &timestamppb.Timestamp{Seconds: createTime.Time.Unix()},
+				UpdateTime:            &timestamppb.Timestamp{Seconds: updateTime.Time.Unix()},
 				Online:                online,
 			},
 			Wallet:      wallet.String,
@@ -274,7 +275,7 @@ func updateAccounts(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates
 		params = append(params, update.userID)
 
 		if update.username != "" {
-			if invalidCharsRegex.MatchString(update.username) {
+			if invalidUsernameRegex.MatchString(update.username) {
 				return errors.New("Username invalid, no spaces or control characters allowed.")
 			}
 			params = append(params, update.username)
@@ -351,7 +352,8 @@ func updateAccounts(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates
 			" WHERE id = $1 AND (" + strings.Join(distinctStatements, " OR ") + ")"
 
 		if _, err := tx.ExecContext(ctx, query, params...); err != nil {
-			if e, ok := err.(pgx.PgError); ok && e.Code == dbErrorUniqueViolation && strings.Contains(e.Message, "users_username_key") {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "users_username_key") {
 				return errors.New("Username is already in use.")
 			}
 
@@ -426,7 +428,7 @@ func ExportAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, userID u
 	}
 
 	// History of user's wallet.
-	walletLedgers, _, err := ListWalletLedger(ctx, logger, db, userID, nil, "")
+	walletLedgers, _, _, err := ListWalletLedger(ctx, logger, db, userID, nil, "")
 	if err != nil {
 		logger.Error("Could not fetch wallet ledger items", zap.Error(err), zap.String("user_id", userID.String()))
 		return nil, status.Error(codes.Internal, "An error occurred while trying to export user data.")
@@ -448,8 +450,8 @@ func ExportAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, userID u
 			UserId:     w.UserID,
 			Changeset:  string(changeset),
 			Metadata:   string(metadata),
-			CreateTime: &timestamp.Timestamp{Seconds: w.CreateTime},
-			UpdateTime: &timestamp.Timestamp{Seconds: w.UpdateTime},
+			CreateTime: &timestamppb.Timestamp{Seconds: w.CreateTime},
+			UpdateTime: &timestamppb.Timestamp{Seconds: w.UpdateTime},
 		}
 	}
 

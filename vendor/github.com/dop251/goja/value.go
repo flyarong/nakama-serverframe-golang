@@ -53,6 +53,21 @@ var (
 
 var intCache [256]Value
 
+// Value represents an ECMAScript value.
+//
+// Export returns a "plain" Go value which type depends on the type of the Value.
+//
+// For integer numbers it's int64.
+//
+// For any other numbers (including Infinities, NaN and negative zero) it's float64.
+//
+// For string it's a string. Note that unicode strings are converted into UTF-8 with invalid code points replaced with utf8.RuneError.
+//
+// For boolean it's bool.
+//
+// For null and undefined it's nil.
+//
+// For Object it depends on the Object type, see Object.Export() for more details.
 type Value interface {
 	ToInteger() int64
 	toString() valueString
@@ -80,6 +95,7 @@ type valueContainer interface {
 
 type typeError string
 type rangeError string
+type referenceError string
 
 type valueInt int64
 type valueFloat float64
@@ -116,6 +132,11 @@ type valueProperty struct {
 	getterFunc   *Object
 	setterFunc   *Object
 }
+
+var (
+	errAccessBeforeInit = referenceError("Cannot access a variable before initialization")
+	errAssignToConst    = typeError("Assignment to constant variable.")
+)
 
 func propGetter(o Value, v Value, r *Runtime) *Object {
 	if v == _undefined {
@@ -199,7 +220,7 @@ func (i valueInt) Equals(other Value) bool {
 	case valueBool:
 		return int64(i) == o.ToInteger()
 	case *Object:
-		return i.Equals(o.toPrimitiveNumber())
+		return i.Equals(o.toPrimitive())
 	}
 
 	return false
@@ -620,7 +641,7 @@ func (f valueFloat) Equals(other Value) bool {
 	case valueString, valueBool:
 		return float64(f) == o.ToFloat()
 	case *Object:
-		return f.Equals(o.toPrimitiveNumber())
+		return f.Equals(o.toPrimitive())
 	}
 
 	return false
@@ -705,7 +726,7 @@ func (o *Object) Equals(other Value) bool {
 	}
 
 	switch o1 := other.(type) {
-	case valueInt, valueFloat, valueString:
+	case valueInt, valueFloat, valueString, *Symbol:
 		return o.toPrimitive().Equals(other)
 	case valueBool:
 		return o.Equals(o1.ToNumber())
@@ -725,10 +746,38 @@ func (o *Object) baseObject(*Runtime) *Object {
 	return o
 }
 
-func (o *Object) Export() interface{} {
-	return o.self.export(&objectExportCtx{})
+// Export the Object to a plain Go type.
+// If the Object is a wrapped Go value (created using ToValue()) returns the original value.
+//
+// If the Object is a function, returns func(FunctionCall) Value. Note that exceptions thrown inside the function
+// result in panics, which can also leave the Runtime in an unusable state. Therefore, these values should only
+// be used inside another ES function implemented in Go. For calling a function from Go, use AssertFunction() or
+// Runtime.ExportTo() as described in the README.
+//
+// For a Map, returns the list of entries as [][2]interface{}.
+//
+// For a Set, returns the list of elements as []interface{}.
+//
+// For a Proxy, returns Proxy.
+//
+// For a Promise, returns Promise.
+//
+// For a DynamicObject or a DynamicArray, returns the underlying handler.
+//
+// For an array, returns its items as []interface{}.
+//
+// In all other cases returns own enumerable non-symbol properties as map[string]interface{}.
+//
+// This method will panic with an *Exception if a JavaScript exception is thrown in the process.
+func (o *Object) Export() (ret interface{}) {
+	o.runtime.tryPanic(func() {
+		ret = o.self.export(&objectExportCtx{})
+	})
+
+	return
 }
 
+// ExportType returns the type of the value that is returned by Export().
 func (o *Object) ExportType() reflect.Type {
 	return o.self.exportType()
 }
@@ -737,19 +786,25 @@ func (o *Object) hash(*maphash.Hash) uint64 {
 	return o.getId()
 }
 
+// Get an object's property by name.
+// This method will panic with an *Exception if a JavaScript exception is thrown in the process.
 func (o *Object) Get(name string) Value {
 	return o.self.getStr(unistring.NewFromString(name), nil)
 }
 
 // GetSymbol returns the value of a symbol property. Use one of the Sym* values for well-known
 // symbols (such as SymIterator, SymToStringTag, etc...).
+// This method will panic with an *Exception if a JavaScript exception is thrown in the process.
 func (o *Object) GetSymbol(sym *Symbol) Value {
 	return o.self.getSym(sym, nil)
 }
 
+// Keys returns a list of Object's enumerable keys.
+// This method will panic with an *Exception if a JavaScript exception is thrown in the process.
 func (o *Object) Keys() (keys []string) {
 	iter := &enumerableIter{
-		wrapped: o.self.enumerateOwnKeys(),
+		o:       o,
+		wrapped: o.self.iterateStringKeys(),
 	}
 	for item, next := iter.next(); next != nil; item, next = next() {
 		keys = append(keys, item.name.String())
@@ -758,8 +813,10 @@ func (o *Object) Keys() (keys []string) {
 	return
 }
 
+// Symbols returns a list of Object's enumerable symbol properties.
+// This method will panic with an *Exception if a JavaScript exception is thrown in the process.
 func (o *Object) Symbols() []*Symbol {
-	symbols := o.self.ownSymbols(false, nil)
+	symbols := o.self.symbols(false, nil)
 	ret := make([]*Symbol, len(symbols))
 	for i, sym := range symbols {
 		ret[i], _ = sym.(*Symbol)
@@ -770,7 +827,7 @@ func (o *Object) Symbols() []*Symbol {
 // DefineDataProperty is a Go equivalent of Object.defineProperty(o, name, {value: value, writable: writable,
 // configurable: configurable, enumerable: enumerable})
 func (o *Object) DefineDataProperty(name string, value Value, writable, configurable, enumerable Flag) error {
-	return tryFunc(func() {
+	return o.runtime.try(func() {
 		o.self.defineOwnPropertyStr(unistring.NewFromString(name), PropertyDescriptor{
 			Value:        value,
 			Writable:     writable,
@@ -783,7 +840,7 @@ func (o *Object) DefineDataProperty(name string, value Value, writable, configur
 // DefineAccessorProperty is a Go equivalent of Object.defineProperty(o, name, {get: getter, set: setter,
 // configurable: configurable, enumerable: enumerable})
 func (o *Object) DefineAccessorProperty(name string, getter, setter Value, configurable, enumerable Flag) error {
-	return tryFunc(func() {
+	return o.runtime.try(func() {
 		o.self.defineOwnPropertyStr(unistring.NewFromString(name), PropertyDescriptor{
 			Getter:       getter,
 			Setter:       setter,
@@ -796,7 +853,7 @@ func (o *Object) DefineAccessorProperty(name string, getter, setter Value, confi
 // DefineDataPropertySymbol is a Go equivalent of Object.defineProperty(o, name, {value: value, writable: writable,
 // configurable: configurable, enumerable: enumerable})
 func (o *Object) DefineDataPropertySymbol(name *Symbol, value Value, writable, configurable, enumerable Flag) error {
-	return tryFunc(func() {
+	return o.runtime.try(func() {
 		o.self.defineOwnPropertySym(name, PropertyDescriptor{
 			Value:        value,
 			Writable:     writable,
@@ -809,7 +866,7 @@ func (o *Object) DefineDataPropertySymbol(name *Symbol, value Value, writable, c
 // DefineAccessorPropertySymbol is a Go equivalent of Object.defineProperty(o, name, {get: getter, set: setter,
 // configurable: configurable, enumerable: enumerable})
 func (o *Object) DefineAccessorPropertySymbol(name *Symbol, getter, setter Value, configurable, enumerable Flag) error {
-	return tryFunc(func() {
+	return o.runtime.try(func() {
 		o.self.defineOwnPropertySym(name, PropertyDescriptor{
 			Getter:       getter,
 			Setter:       setter,
@@ -820,25 +877,25 @@ func (o *Object) DefineAccessorPropertySymbol(name *Symbol, getter, setter Value
 }
 
 func (o *Object) Set(name string, value interface{}) error {
-	return tryFunc(func() {
+	return o.runtime.try(func() {
 		o.self.setOwnStr(unistring.NewFromString(name), o.runtime.ToValue(value), true)
 	})
 }
 
 func (o *Object) SetSymbol(name *Symbol, value interface{}) error {
-	return tryFunc(func() {
+	return o.runtime.try(func() {
 		o.self.setOwnSym(name, o.runtime.ToValue(value), true)
 	})
 }
 
 func (o *Object) Delete(name string) error {
-	return tryFunc(func() {
+	return o.runtime.try(func() {
 		o.self.deleteStr(unistring.NewFromString(name), true)
 	})
 }
 
 func (o *Object) DeleteSymbol(name *Symbol) error {
-	return tryFunc(func() {
+	return o.runtime.try(func() {
 		o.self.deleteSym(name, true)
 	})
 }
@@ -852,7 +909,7 @@ func (o *Object) Prototype() *Object {
 // SetPrototype sets the Object's prototype, same as Object.setPrototypeOf(). Setting proto to nil
 // is an equivalent of Object.setPrototypeOf(null).
 func (o *Object) SetPrototype(proto *Object) error {
-	return tryFunc(func() {
+	return o.runtime.try(func() {
 		o.self.setProto(proto, true)
 	})
 }
@@ -976,11 +1033,17 @@ func (s *Symbol) ToString() Value {
 }
 
 func (s *Symbol) String() string {
-	return s.desc.String()
+	if s.desc != nil {
+		return s.desc.String()
+	}
+	return ""
 }
 
 func (s *Symbol) string() unistring.String {
-	return s.desc.string()
+	if s.desc != nil {
+		return s.desc.string()
+	}
+	return ""
 }
 
 func (s *Symbol) ToFloat() float64 {
@@ -1007,6 +1070,10 @@ func (s *Symbol) SameAs(other Value) bool {
 }
 
 func (s *Symbol) Equals(o Value) bool {
+	switch o := o.(type) {
+	case *Object:
+		return s.Equals(o.toPrimitive())
+	}
 	return s.SameAs(o)
 }
 
@@ -1054,10 +1121,26 @@ func NewSymbol(s string) *Symbol {
 }
 
 func (s *Symbol) descriptiveString() valueString {
-	if s.desc == nil {
-		return stringEmpty
+	desc := s.desc
+	if desc == nil {
+		desc = stringEmpty
 	}
-	return asciiString("Symbol(").concat(s.desc).concat(asciiString(")"))
+	return asciiString("Symbol(").concat(desc).concat(asciiString(")"))
+}
+
+func funcName(prefix string, n Value) valueString {
+	var b valueStringBuilder
+	b.WriteString(asciiString(prefix))
+	if sym, ok := n.(*Symbol); ok {
+		if sym.desc != nil {
+			b.WriteRune('[')
+			b.WriteString(sym.desc)
+			b.WriteRune(']')
+		}
+	} else {
+		b.WriteString(n.toString())
+	}
+	return b.String()
 }
 
 func init() {

@@ -18,9 +18,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"github.com/gofrs/uuid"
 
-	"github.com/jackc/pgx/pgtype"
+	"github.com/gofrs/uuid"
+	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

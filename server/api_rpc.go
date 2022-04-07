@@ -86,14 +86,16 @@ func (s *ApiServer) RpcFuncHttp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// After this point the RPC will be captured in metrics.
 	start := time.Now()
 	var success bool
 	var recvBytes, sentBytes int
-	defer func() {
-		s.metrics.Api("Rpc", time.Since(start), int64(recvBytes), int64(sentBytes), !success)
-	}()
 	var err error
+	var id string
+
+	// After this point the RPC will be captured in metrics.
+	defer func() {
+		s.metrics.ApiRpc(id, time.Since(start), int64(recvBytes), int64(sentBytes), !success)
+	}()
 
 	// Check the RPC function ID.
 	maybeID, ok := mux.Vars(r)["id"]
@@ -107,7 +109,7 @@ func (s *ApiServer) RpcFuncHttp(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	id := strings.ToLower(maybeID)
+	id = strings.ToLower(maybeID)
 
 	// Find the correct RPC function.
 	fn := s.runtime.Rpc(id)
@@ -180,8 +182,20 @@ func (s *ApiServer) RpcFuncHttp(w http.ResponseWriter, r *http.Request) {
 
 	clientIP, clientPort := extractClientAddressFromRequest(s.logger, r)
 
+	// Extract http headers
+	headers := make(map[string][]string)
+	for k, v := range r.Header {
+		if k == "Grpc-Timeout" {
+			continue
+		}
+		headers[k] = make([]string, 0, len(v))
+		for _, h := range v {
+			headers[k] = append(headers[k], h)
+		}
+	}
+
 	// Execute the function.
-	result, fnErr, code := fn(r.Context(), queryParams, uid, username, vars, expiry, "", clientIP, clientPort, payload)
+	result, fnErr, code := fn(r.Context(), headers, queryParams, uid, username, vars, expiry, "", clientIP, clientPort, "", payload)
 	if fnErr != nil {
 		response, _ := json.Marshal(map[string]interface{}{"error": fnErr, "message": fnErr.Error(), "code": code})
 		w.Header().Set("content-type", "application/json")
@@ -247,6 +261,7 @@ func (s *ApiServer) RpcFunc(ctx context.Context, in *api.Rpc) (*api.Rpc, error) 
 		return nil, status.Error(codes.NotFound, "RPC function not found")
 	}
 
+	headers := make(map[string][]string, 0)
 	queryParams := make(map[string][]string, 0)
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
@@ -256,6 +271,8 @@ func (s *ApiServer) RpcFunc(ctx context.Context, in *api.Rpc) (*api.Rpc, error) 
 		// Only process the keys representing custom query parameters.
 		if strings.HasPrefix(k, "q_") {
 			queryParams[k[2:]] = vs
+		} else {
+			headers[k] = vs
 		}
 	}
 
@@ -278,7 +295,7 @@ func (s *ApiServer) RpcFunc(ctx context.Context, in *api.Rpc) (*api.Rpc, error) 
 
 	clientIP, clientPort := extractClientAddressFromContext(s.logger, ctx)
 
-	result, fnErr, code := fn(ctx, queryParams, uid, username, vars, expiry, "", clientIP, clientPort, in.Payload)
+	result, fnErr, code := fn(ctx, headers, queryParams, uid, username, vars, expiry, "", clientIP, clientPort, "", in.Payload)
 	if fnErr != nil {
 		return nil, status.Error(code, fnErr.Error())
 	}

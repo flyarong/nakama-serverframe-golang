@@ -21,47 +21,52 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/heroiclabs/nakama-common/runtime"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/heroiclabs/nakama-common/rtapi"
-
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/timestamp"
-	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/heroiclabs/nakama-common/api"
-	"github.com/jackc/pgx"
-	"github.com/jackc/pgx/pgtype"
-	"github.com/pkg/errors"
+	"github.com/heroiclabs/nakama-common/rtapi"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-var (
-	ErrGroupNameInUse         = errors.New("group name in use")
-	ErrGroupPermissionDenied  = errors.New("group permission denied")
-	ErrGroupNoUpdateOps       = errors.New("no group updates")
-	ErrGroupNotUpdated        = errors.New("group not updated")
-	ErrGroupNotFound          = errors.New("group not found")
-	ErrGroupFull              = errors.New("group is full")
-	ErrGroupUserNotFound      = errors.New("user not found")
-	ErrGroupLastSuperadmin    = errors.New("user is last group superadmin")
-	ErrGroupUserInvalidCursor = errors.New("group user cursor invalid")
-	ErrUserGroupInvalidCursor = errors.New("user group cursor invalid")
-)
+var ErrEmptyMemberDemote = errors.New("could not demote member")
+var ErrEmptyMemberPromote = errors.New("could not promote member")
+var ErrEmptyMemberKick = errors.New("could not kick member")
 
 type groupListCursor struct {
-	Lang      string
-	EdgeCount int32
-	ID        uuid.UUID
+	Lang       string
+	EdgeCount  int32
+	ID         uuid.UUID
+	Open       bool
+	Name       string
+	UpdateTime int64
+}
+
+func (c *groupListCursor) GetState() int {
+	if c.Open {
+		return 1
+	}
+	return 0
+}
+func (c *groupListCursor) GetUpdateTime() time.Time {
+	return time.Unix(c.UpdateTime, 0)
 }
 
 func CreateGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, creatorID uuid.UUID, name, lang, desc, avatarURL, metadata string, open bool, maxCount int) (*api.Group, error) {
 	if userID == uuid.Nil {
-		logger.Panic("This function must be used with non-system user ID.")
+		return nil, runtime.ErrGroupCreatorInvalid
 	}
 
 	state := 1
@@ -97,27 +102,29 @@ func CreateGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uui
 	query += `, edge_count) VALUES (` + strings.Join(statements, ",") + `,1)
 RETURNING id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time`
 
+	var group *api.Group
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		logger.Error("Could not begin database transaction.", zap.Error(err))
 		return nil, err
 	}
 
-	var group *api.Group
 	if err = ExecuteInTx(ctx, tx, func() error {
 		rows, err := tx.QueryContext(ctx, query, params...)
 		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
+				logger.Info("Could not create group as it already exists.", zap.String("name", name))
+				return runtime.ErrGroupNameInUse
+			}
 			logger.Debug("Could not create group.", zap.Error(err))
 			return err
 		}
 		// Rows closed in groupConvertRows()
 
-		groups, err := groupConvertRows(rows)
+		groups, err := groupConvertRows(rows, 1)
 		if err != nil {
-			if e, ok := err.(pgx.PgError); ok && e.Code == dbErrorUniqueViolation {
-				logger.Info("Could not create group as it already exists.", zap.String("name", name))
-				return ErrGroupNameInUse
-			}
 			logger.Debug("Could not parse rows.", zap.Error(err))
 			return err
 		}
@@ -131,17 +138,19 @@ RETURNING id, creator_id, name, description, avatar_url, state, edge_count, lang
 
 		return nil
 	}); err != nil {
-		if err == ErrGroupNameInUse {
-			return nil, ErrGroupNameInUse
+		if err == runtime.ErrGroupNameInUse {
+			return nil, runtime.ErrGroupNameInUse
 		}
 		logger.Error("Error creating group.", zap.Error(err))
 		return nil, err
 	}
 
+	logger.Info("Group created.", zap.String("group_id", group.Id), zap.String("user_id", userID.String()))
+
 	return group, nil
 }
 
-func UpdateGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, groupID uuid.UUID, userID uuid.UUID, creatorID uuid.UUID, name, lang, desc, avatar, metadata *wrappers.StringValue, open *wrappers.BoolValue, maxCount int) error {
+func UpdateGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, groupID uuid.UUID, userID uuid.UUID, creatorID uuid.UUID, name, lang, desc, avatar, metadata *wrapperspb.StringValue, open *wrapperspb.BoolValue, maxCount int) error {
 	if userID != uuid.Nil {
 		allowedUser, err := groupCheckUserPermission(ctx, logger, db, groupID, userID, 1)
 		if err != nil {
@@ -150,7 +159,7 @@ func UpdateGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, groupID uu
 
 		if !allowedUser {
 			logger.Info("User does not have permission to update group.", zap.String("group", groupID.String()), zap.String("user", userID.String()))
-			return ErrGroupPermissionDenied
+			return runtime.ErrGroupPermissionDenied
 		}
 	}
 
@@ -219,15 +228,16 @@ func UpdateGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, groupID uu
 
 	if len(statements) == 0 {
 		logger.Info("Did not update group as no fields were changed.")
-		return ErrGroupNoUpdateOps
+		return runtime.ErrGroupNoUpdateOps
 	}
 
 	query := "UPDATE groups SET update_time = now(), " + strings.Join(statements, ", ") + " WHERE (id = $1) AND (disable_time = '1970-01-01 00:00:00 UTC')"
 	res, err := db.ExecContext(ctx, query, params...)
 	if err != nil {
-		if e, ok := err.(pgx.PgError); ok && e.Code == dbErrorUniqueViolation {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
 			logger.Info("Could not update group as it already exists.", zap.String("group_id", groupID.String()))
-			return ErrGroupNameInUse
+			return runtime.ErrGroupNameInUse
 		}
 		logger.Error("Could not update group.", zap.Error(err))
 		return err
@@ -239,8 +249,11 @@ func UpdateGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, groupID uu
 		return err
 	}
 	if rowsAffected == 0 {
-		return ErrGroupNotUpdated
+		return runtime.ErrGroupNotUpdated
 	}
+
+	logger.Info("Group updated.", zap.String("group_id", groupID.String()), zap.String("user_id", userID.String()))
+
 	return nil
 }
 
@@ -254,7 +267,7 @@ func DeleteGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, groupID uu
 
 		if !allowedUser {
 			logger.Info("User does not have permission to delete group.", zap.String("group_id", groupID.String()), zap.String("user_id", userID.String()))
-			return ErrGroupPermissionDenied
+			return runtime.ErrGroupPermissionDenied
 		}
 	}
 
@@ -271,6 +284,8 @@ func DeleteGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, groupID uu
 		return err
 	}
 
+	logger.Info("Group deleted.", zap.String("group_id", groupID.String()), zap.String("user_id", userID.String()))
+
 	return nil
 }
 
@@ -286,7 +301,7 @@ WHERE (id = $1) AND (disable_time = '1970-01-01 00:00:00 UTC')`
 	}
 	// Rows closed in groupConvertRows()
 
-	groups, err := groupConvertRows(rows)
+	groups, err := groupConvertRows(rows, 1)
 	if err != nil {
 		logger.Error("Could not parse groups.", zap.Error(err))
 		return err
@@ -294,13 +309,13 @@ WHERE (id = $1) AND (disable_time = '1970-01-01 00:00:00 UTC')`
 
 	if len(groups) == 0 {
 		logger.Info("Group does not exist.", zap.Error(err), zap.String("group_id", groupID.String()))
-		return ErrGroupNotFound
+		return runtime.ErrGroupNotFound
 	}
 
 	group := groups[0]
 	if group.EdgeCount >= group.MaxCount {
 		logger.Info("Group maximum count has reached.", zap.Error(err), zap.String("group_id", groupID.String()))
-		return ErrGroupFull
+		return runtime.ErrGroupFull
 	}
 
 	state := 2
@@ -308,7 +323,8 @@ WHERE (id = $1) AND (disable_time = '1970-01-01 00:00:00 UTC')`
 		state = 3
 		_, err = groupAddUser(ctx, db, nil, uuid.Must(uuid.FromString(group.Id)), userID, state)
 		if err != nil {
-			if e, ok := err.(pgx.PgError); ok && e.Code == dbErrorUniqueViolation {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
 				logger.Info("Could not add user to group as relationship already exists.", zap.String("group_id", groupID.String()), zap.String("user_id", userID.String()))
 				return nil // completed successfully
 			}
@@ -350,7 +366,7 @@ WHERE (id = $1) AND (disable_time = '1970-01-01 00:00:00 UTC')`
 							SenderId:   userID.String(),
 							Code:       NotificationCodeGroupJoinRequest,
 							Persistent: true,
-							CreateTime: &timestamp.Timestamp{Seconds: time.Now().UTC().Unix()},
+							CreateTime: &timestamppb.Timestamp{Seconds: time.Now().UTC().Unix()},
 						},
 					}
 				}
@@ -381,13 +397,13 @@ WHERE (id = $1) AND (disable_time = '1970-01-01 00:00:00 UTC')`
 	message := &api.ChannelMessage{
 		ChannelId:  channelID,
 		MessageId:  uuid.Must(uuid.NewV4()).String(),
-		Code:       &wrappers.Int32Value{Value: ChannelMessageTypeGroupJoin},
+		Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeGroupJoin},
 		SenderId:   userID.String(),
 		Username:   username,
 		Content:    "{}",
-		CreateTime: &timestamp.Timestamp{Seconds: ts},
-		UpdateTime: &timestamp.Timestamp{Seconds: ts},
-		Persistent: &wrappers.BoolValue{Value: true},
+		CreateTime: &timestamppb.Timestamp{Seconds: ts},
+		UpdateTime: &timestamppb.Timestamp{Seconds: ts},
+		Persistent: &wrapperspb.BoolValue{Value: true},
 		GroupId:    group.Id,
 	}
 
@@ -399,9 +415,10 @@ WHERE (id = $1) AND (disable_time = '1970-01-01 00:00:00 UTC')`
 
 	if err = ExecuteInTx(ctx, tx, func() error {
 		if _, err = groupAddUser(ctx, db, tx, uuid.Must(uuid.FromString(group.Id)), userID, state); err != nil {
-			if e, ok := err.(pgx.PgError); ok && e.Code == dbErrorUniqueViolation {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
 				logger.Info("Could not add user to group as relationship already exists.", zap.String("group_id", groupID.String()), zap.String("user_id", userID.String()))
-				return e
+				return pgErr
 			}
 
 			logger.Debug("Could not add user to group.", zap.String("group_id", groupID.String()), zap.String("user_id", userID.String()))
@@ -423,7 +440,8 @@ VALUES ($1, $2, $3, $4, $5, $6::UUID, $7::UUID, $8, $9, $10, $10)`
 
 		return nil
 	}); err != nil {
-		if e, ok := err.(pgx.PgError); ok && e.Code == dbErrorUniqueViolation {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
 			// No-op, user was already in group.
 			return nil
 		}
@@ -461,7 +479,7 @@ func LeaveGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, router Mess
 
 		if otherSuperadminCount.Int64 == 0 {
 			logger.Info("Cannot leave group as user is last superadmin.", zap.String("group_id", groupID.String()), zap.String("user_id", userID.String()))
-			return ErrGroupLastSuperadmin
+			return runtime.ErrGroupLastSuperadmin
 		}
 	}
 
@@ -479,13 +497,13 @@ func LeaveGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, router Mess
 	message := &api.ChannelMessage{
 		ChannelId:  channelID,
 		MessageId:  uuid.Must(uuid.NewV4()).String(),
-		Code:       &wrappers.Int32Value{Value: ChannelMessageTypeGroupLeave},
+		Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeGroupLeave},
 		SenderId:   userID.String(),
 		Username:   username,
 		Content:    "{}",
-		CreateTime: &timestamp.Timestamp{Seconds: ts},
-		UpdateTime: &timestamp.Timestamp{Seconds: ts},
-		Persistent: &wrappers.BoolValue{Value: true},
+		CreateTime: &timestamppb.Timestamp{Seconds: ts},
+		UpdateTime: &timestamppb.Timestamp{Seconds: ts},
+		Persistent: &wrapperspb.BoolValue{Value: true},
 		GroupId:    groupID.String(),
 	}
 
@@ -520,7 +538,7 @@ func LeaveGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, router Mess
 
 			if rowsAffected == 0 {
 				logger.Debug("Did not update group edge_count as group is disabled.")
-				return ErrGroupNotFound
+				return runtime.ErrGroupNotFound
 			}
 		}
 
@@ -550,7 +568,7 @@ func AddGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router M
 		if err := db.QueryRowContext(ctx, query, groupID, caller).Scan(&dbState); err != nil {
 			if err == sql.ErrNoRows {
 				logger.Info("Could not retrieve state as no group relationship exists.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
-				return ErrGroupPermissionDenied
+				return runtime.ErrGroupPermissionDenied
 			}
 			logger.Error("Could not retrieve state from group_edge.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
 			return err
@@ -558,7 +576,7 @@ func AddGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router M
 
 		if dbState.Int64 > 1 {
 			logger.Info("Cannot add users as user does not have correct permissions.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()), zap.Int64("state", dbState.Int64))
-			return ErrGroupPermissionDenied
+			return runtime.ErrGroupPermissionDenied
 		}
 	}
 
@@ -567,15 +585,9 @@ func AddGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router M
 	if err := db.QueryRowContext(ctx, query, groupID).Scan(&groupName); err != nil {
 		if err == sql.ErrNoRows {
 			logger.Info("Cannot add users to disabled group.", zap.String("group_id", groupID.String()))
-			return ErrGroupNotFound
+			return runtime.ErrGroupNotFound
 		}
 		logger.Error("Could not look up group when adding users.", zap.Error(err), zap.String("group_id", groupID.String()))
-		return err
-	}
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("Could not begin database transaction.", zap.Error(err))
 		return err
 	}
 
@@ -602,6 +614,12 @@ func AddGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router M
 	ts := time.Now().Unix()
 	var messages []*api.ChannelMessage
 
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		logger.Error("Could not begin database transaction.", zap.Error(err))
+		return err
+	}
+
 	if err := ExecuteInTx(ctx, tx, func() error {
 		// If the transaction is retried ensure we wipe any notifications/messages that may have been prepared by previous attempts.
 		notifications = make(map[uuid.UUID][]*api.Notification, len(userIDs))
@@ -617,7 +635,7 @@ func AddGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router M
 			query := "SELECT username FROM users WHERE id = $1::UUID"
 			if err := tx.QueryRowContext(ctx, query, uid).Scan(&username); err != nil {
 				if err == sql.ErrNoRows {
-					return ErrGroupUserNotFound
+					return runtime.ErrGroupUserNotFound
 				}
 				logger.Debug("Could not retrieve username to add user to group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
 				return err
@@ -661,7 +679,7 @@ func AddGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router M
 					return err
 				} else if rowsAffected == 0 {
 					logger.Info("Could not add users as group maximum count was reached.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
-					return ErrGroupFull
+					return runtime.ErrGroupFull
 				}
 			} else {
 				// If we reach here then this was a repeated (or failed, if the user was banned) operation.
@@ -672,13 +690,13 @@ func AddGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router M
 			message := &api.ChannelMessage{
 				ChannelId:  channelID,
 				MessageId:  uuid.Must(uuid.NewV4()).String(),
-				Code:       &wrappers.Int32Value{Value: ChannelMessageTypeGroupAdd},
+				Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeGroupAdd},
 				SenderId:   uid.String(),
 				Username:   username.String,
 				Content:    "{}",
-				CreateTime: &timestamp.Timestamp{Seconds: ts},
-				UpdateTime: &timestamp.Timestamp{Seconds: ts},
-				Persistent: &wrappers.BoolValue{Value: true},
+				CreateTime: &timestamppb.Timestamp{Seconds: ts},
+				UpdateTime: &timestamppb.Timestamp{Seconds: ts},
+				Persistent: &wrapperspb.BoolValue{Value: true},
 				GroupId:    groupID.String(),
 			}
 
@@ -699,7 +717,7 @@ VALUES ($1, $2, $3, $4, $5, $6::UUID, $7::UUID, $8, $9, $10, $10)`
 					SenderId:   caller.String(),
 					Code:       NotificationCodeGroupAdd,
 					Persistent: true,
-					CreateTime: &timestamp.Timestamp{Seconds: time.Now().UTC().Unix()},
+					CreateTime: &timestamppb.Timestamp{Seconds: time.Now().UTC().Unix()},
 				},
 			}
 		}
@@ -728,7 +746,7 @@ func BanGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router M
 		if err := db.QueryRowContext(ctx, query, groupID, caller).Scan(&dbState); err != nil {
 			if err == sql.ErrNoRows {
 				logger.Info("Could not retrieve state as no group relationship exists.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
-				return ErrGroupPermissionDenied
+				return runtime.ErrGroupPermissionDenied
 			}
 			logger.Error("Could not retrieve state from group_edge.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
 			return err
@@ -737,7 +755,7 @@ func BanGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router M
 		myState = int(dbState.Int64)
 		if myState > 1 {
 			logger.Info("Cannot ban users as user does not have correct permissions.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()), zap.Int("state", myState))
-			return ErrGroupPermissionDenied
+			return runtime.ErrGroupPermissionDenied
 		}
 	}
 
@@ -844,7 +862,7 @@ UPDATE SET state = $2, update_time = now()`
 				query = "SELECT username FROM users WHERE id = $1::UUID"
 				if err := tx.QueryRowContext(ctx, query, uid).Scan(&username); err != nil {
 					if err == sql.ErrNoRows {
-						return ErrGroupUserNotFound
+						return runtime.ErrGroupUserNotFound
 					}
 					logger.Debug("Could not retrieve username to ban user from group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
 					return err
@@ -853,13 +871,13 @@ UPDATE SET state = $2, update_time = now()`
 				message := &api.ChannelMessage{
 					ChannelId:  channelID,
 					MessageId:  uuid.Must(uuid.NewV4()).String(),
-					Code:       &wrappers.Int32Value{Value: ChannelMessageTypeGroupBan},
+					Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeGroupBan},
 					SenderId:   uid.String(),
 					Username:   username.String,
 					Content:    "{}",
-					CreateTime: &timestamp.Timestamp{Seconds: ts},
-					UpdateTime: &timestamp.Timestamp{Seconds: ts},
-					Persistent: &wrappers.BoolValue{Value: true},
+					CreateTime: &timestamppb.Timestamp{Seconds: ts},
+					UpdateTime: &timestamppb.Timestamp{Seconds: ts},
+					Persistent: &wrapperspb.BoolValue{Value: true},
 					GroupId:    groupID.String(),
 				}
 
@@ -894,7 +912,7 @@ func KickGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router 
 		if err := db.QueryRowContext(ctx, query, groupID, caller).Scan(&dbState); err != nil {
 			if err == sql.ErrNoRows {
 				logger.Info("Could not retrieve state as no group relationship exists.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
-				return ErrGroupPermissionDenied
+				return runtime.ErrGroupPermissionDenied
 			}
 			logger.Error("Could not retrieve state from group_edge.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
 			return err
@@ -903,8 +921,20 @@ func KickGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router 
 		myState = int(dbState.Int64)
 		if myState > 1 {
 			logger.Info("Cannot kick users as user does not have correct permissions.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()), zap.Int("state", myState))
-			return ErrGroupPermissionDenied
+			return runtime.ErrGroupPermissionDenied
 		}
+	}
+
+	var groupExists sql.NullBool
+	query := "SELECT EXISTS (SELECT id FROM groups WHERE id = $1 AND disable_time = '1970-01-01 00:00:00 UTC')"
+	err := db.QueryRowContext(ctx, query, groupID).Scan(&groupExists)
+	if err != nil {
+		logger.Error("Could not look up group when kicking users.", zap.Error(err), zap.String("group_id", groupID.String()))
+		return err
+	}
+	if !groupExists.Bool {
+		logger.Info("Cannot kick users in a disabled group.", zap.String("group_id", groupID.String()))
+		return runtime.ErrGroupNotFound
 	}
 
 	// Prepare the messages we'll need to send to the group channel.
@@ -917,6 +947,7 @@ func KickGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, router 
 		logger.Error("Could not create channel ID.", zap.Error(err))
 		return err
 	}
+
 	ts := time.Now().Unix()
 	var messages []*api.ChannelMessage
 
@@ -999,32 +1030,31 @@ RETURNING state`
 				query = "SELECT username FROM users WHERE id = $1::UUID"
 				if err := tx.QueryRowContext(ctx, query, uid).Scan(&username); err != nil {
 					if err == sql.ErrNoRows {
-						return ErrGroupUserNotFound
+						return runtime.ErrGroupUserNotFound
 					}
-					logger.Debug("Could not retrieve username to kick user from group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
+					logger.Debug("Could not retrieve username to kick user in group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
 					return err
 				}
 
 				message := &api.ChannelMessage{
 					ChannelId:  channelID,
 					MessageId:  uuid.Must(uuid.NewV4()).String(),
-					Code:       &wrappers.Int32Value{Value: ChannelMessageTypeGroupKick},
+					Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeGroupKick},
 					SenderId:   uid.String(),
 					Username:   username.String,
 					Content:    "{}",
-					CreateTime: &timestamp.Timestamp{Seconds: ts},
-					UpdateTime: &timestamp.Timestamp{Seconds: ts},
-					Persistent: &wrappers.BoolValue{Value: true},
+					CreateTime: &timestamppb.Timestamp{Seconds: ts},
+					UpdateTime: &timestamppb.Timestamp{Seconds: ts},
+					Persistent: &wrapperspb.BoolValue{Value: true},
 					GroupId:    groupID.String(),
 				}
 
 				query = `INSERT INTO message (id, code, sender_id, username, stream_mode, stream_subject, stream_descriptor, stream_label, content, create_time, update_time)
 VALUES ($1, $2, $3, $4, $5, $6::UUID, $7::UUID, $8, $9, $10, $10)`
-				if _, err = tx.ExecContext(ctx, query, message.MessageId, message.Code.Value, message.SenderId, message.Username, stream.Mode, stream.Subject, stream.Subcontext, stream.Label, message.Content, time.Unix(message.CreateTime.Seconds, 0).UTC()); err != nil {
-					logger.Debug("Could insert group kick channel message.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
+				if _, err := tx.ExecContext(ctx, query, message.MessageId, message.Code.Value, message.SenderId, message.Username, stream.Mode, stream.Subject, stream.Subcontext, stream.Label, message.Content, time.Unix(message.CreateTime.Seconds, 0).UTC()); err != nil {
+					logger.Debug("Could not insert group demote channel message.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
 					return err
 				}
-
 				messages = append(messages, message)
 			}
 		}
@@ -1049,7 +1079,7 @@ func PromoteGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, rout
 		if err := db.QueryRowContext(ctx, query, groupID, caller).Scan(&dbState); err != nil {
 			if err == sql.ErrNoRows {
 				logger.Info("Could not retrieve state as no group relationship exists.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
-				return ErrGroupPermissionDenied
+				return runtime.ErrGroupPermissionDenied
 			}
 			logger.Error("Could not retrieve state from group_edge.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
 			return err
@@ -1058,7 +1088,7 @@ func PromoteGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, rout
 		myState = int(dbState.Int64)
 		if myState > 1 {
 			logger.Info("Cannot promote users as user does not have correct permissions.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()), zap.Int("state", myState))
-			return ErrGroupPermissionDenied
+			return runtime.ErrGroupPermissionDenied
 		}
 	}
 
@@ -1070,8 +1100,8 @@ func PromoteGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, rout
 		return err
 	}
 	if !groupExists.Bool {
-		logger.Info("Cannot promote users to disabled group.", zap.String("group_id", groupID.String()))
-		return ErrGroupNotFound
+		logger.Info("Cannot promote users in a disabled group.", zap.String("group_id", groupID.String()))
+		return runtime.ErrGroupNotFound
 	}
 
 	// Prepare the messages we'll need to send to the group channel.
@@ -1084,6 +1114,7 @@ func PromoteGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, rout
 		logger.Error("Could not create channel ID.", zap.Error(err))
 		return err
 	}
+
 	ts := time.Now().Unix()
 	var messages []*api.ChannelMessage
 
@@ -1120,19 +1151,9 @@ RETURNING state`
 			}
 
 			if newState.Int64 == 2 {
-				query = "UPDATE groups SET edge_count = edge_count + 1, update_time = now() WHERE id = $1::UUID AND edge_count+1 <= max_count"
-				res, err := tx.ExecContext(ctx, query, groupID)
+				err := incrementGroupEdge(ctx, logger, tx, uid, groupID)
 				if err != nil {
-					logger.Debug("Could not update group edge_count.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()), zap.Error(err))
 					return err
-				}
-
-				if rowsAffected, err := res.RowsAffected(); err != nil {
-					logger.Debug("Could not retrieve affect rows.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()), zap.Error(err))
-					return err
-				} else if rowsAffected == 0 {
-					logger.Debug("Did not update group edge count - check edge count has not reached max count.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
-					return ErrGroupFull
 				}
 			}
 
@@ -1141,7 +1162,7 @@ RETURNING state`
 			query = "SELECT username FROM users WHERE id = $1::UUID"
 			if err := tx.QueryRowContext(ctx, query, uid).Scan(&username); err != nil {
 				if err == sql.ErrNoRows {
-					return ErrGroupUserNotFound
+					return runtime.ErrGroupUserNotFound
 				}
 				logger.Debug("Could not retrieve username to promote user in group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
 				return err
@@ -1150,23 +1171,22 @@ RETURNING state`
 			message := &api.ChannelMessage{
 				ChannelId:  channelID,
 				MessageId:  uuid.Must(uuid.NewV4()).String(),
-				Code:       &wrappers.Int32Value{Value: ChannelMessageTypeGroupPromote},
+				Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeGroupPromote},
 				SenderId:   uid.String(),
 				Username:   username.String,
 				Content:    "{}",
-				CreateTime: &timestamp.Timestamp{Seconds: ts},
-				UpdateTime: &timestamp.Timestamp{Seconds: ts},
-				Persistent: &wrappers.BoolValue{Value: true},
+				CreateTime: &timestamppb.Timestamp{Seconds: ts},
+				UpdateTime: &timestamppb.Timestamp{Seconds: ts},
+				Persistent: &wrapperspb.BoolValue{Value: true},
 				GroupId:    groupID.String(),
 			}
 
 			query = `INSERT INTO message (id, code, sender_id, username, stream_mode, stream_subject, stream_descriptor, stream_label, content, create_time, update_time)
 VALUES ($1, $2, $3, $4, $5, $6::UUID, $7::UUID, $8, $9, $10, $10)`
-			if _, err = tx.ExecContext(ctx, query, message.MessageId, message.Code.Value, message.SenderId, message.Username, stream.Mode, stream.Subject, stream.Subcontext, stream.Label, message.Content, time.Unix(message.CreateTime.Seconds, 0).UTC()); err != nil {
-				logger.Debug("Could not insert group promote channel message.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
+			if _, err := tx.ExecContext(ctx, query, message.MessageId, message.Code.Value, message.SenderId, message.Username, stream.Mode, stream.Subject, stream.Subcontext, stream.Label, message.Content, time.Unix(message.CreateTime.Seconds, 0).UTC()); err != nil {
+				logger.Debug("Could not insert group demote channel message.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
 				return err
 			}
-
 			messages = append(messages, message)
 		}
 		return nil
@@ -1190,7 +1210,7 @@ func DemoteGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, route
 		if err := db.QueryRowContext(ctx, query, groupID, caller).Scan(&dbState); err != nil {
 			if err == sql.ErrNoRows {
 				logger.Info("Could not retrieve state as no group relationship exists.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
-				return ErrGroupPermissionDenied
+				return runtime.ErrGroupPermissionDenied
 			}
 			logger.Error("Could not retrieve state from group_edge.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
 			return err
@@ -1199,7 +1219,7 @@ func DemoteGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, route
 		myState = int(dbState.Int64)
 		if myState > 1 {
 			logger.Info("Cannot demote users as user does not have correct permissions.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()), zap.Int("state", myState))
-			return ErrGroupPermissionDenied
+			return runtime.ErrGroupPermissionDenied
 		}
 	}
 
@@ -1212,7 +1232,7 @@ func DemoteGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, route
 	}
 	if !groupExists.Bool {
 		logger.Info("Cannot demote users in a disabled group.", zap.String("group_id", groupID.String()))
-		return ErrGroupNotFound
+		return runtime.ErrGroupNotFound
 	}
 
 	// Prepare the messages we'll need to send to the group channel.
@@ -1225,6 +1245,7 @@ func DemoteGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, route
 		logger.Error("Could not create channel ID.", zap.Error(err))
 		return err
 	}
+
 	ts := time.Now().Unix()
 	var messages []*api.ChannelMessage
 
@@ -1287,7 +1308,7 @@ RETURNING state`
 			query = "SELECT username FROM users WHERE id = $1::UUID"
 			if err := tx.QueryRowContext(ctx, query, uid).Scan(&username); err != nil {
 				if err == sql.ErrNoRows {
-					return ErrGroupUserNotFound
+					return runtime.ErrGroupUserNotFound
 				}
 				logger.Debug("Could not retrieve username to demote user in group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
 				return err
@@ -1296,23 +1317,22 @@ RETURNING state`
 			message := &api.ChannelMessage{
 				ChannelId:  channelID,
 				MessageId:  uuid.Must(uuid.NewV4()).String(),
-				Code:       &wrappers.Int32Value{Value: ChannelMessageTypeGroupDemote},
+				Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeGroupDemote},
 				SenderId:   uid.String(),
 				Username:   username.String,
 				Content:    "{}",
-				CreateTime: &timestamp.Timestamp{Seconds: ts},
-				UpdateTime: &timestamp.Timestamp{Seconds: ts},
-				Persistent: &wrappers.BoolValue{Value: true},
+				CreateTime: &timestamppb.Timestamp{Seconds: ts},
+				UpdateTime: &timestamppb.Timestamp{Seconds: ts},
+				Persistent: &wrapperspb.BoolValue{Value: true},
 				GroupId:    groupID.String(),
 			}
 
 			query = `INSERT INTO message (id, code, sender_id, username, stream_mode, stream_subject, stream_descriptor, stream_label, content, create_time, update_time)
 VALUES ($1, $2, $3, $4, $5, $6::UUID, $7::UUID, $8, $9, $10, $10)`
-			if _, err = tx.ExecContext(ctx, query, message.MessageId, message.Code.Value, message.SenderId, message.Username, stream.Mode, stream.Subject, stream.Subcontext, stream.Label, message.Content, time.Unix(message.CreateTime.Seconds, 0).UTC()); err != nil {
+			if _, err := tx.ExecContext(ctx, query, message.MessageId, message.Code.Value, message.SenderId, message.Username, stream.Mode, stream.Subject, stream.Subcontext, stream.Label, message.Content, time.Unix(message.CreateTime.Seconds, 0).UTC()); err != nil {
 				logger.Debug("Could not insert group demote channel message.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
 				return err
 			}
-
 			messages = append(messages, message)
 		}
 		return nil
@@ -1328,21 +1348,21 @@ VALUES ($1, $2, $3, $4, $5, $6::UUID, $7::UUID, $8, $9, $10, $10)`
 	return nil
 }
 
-func ListGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, groupID uuid.UUID, limit int, state *wrappers.Int32Value, cursor string) (*api.GroupUserList, error) {
+func ListGroupUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, groupID uuid.UUID, limit int, state *wrapperspb.Int32Value, cursor string) (*api.GroupUserList, error) {
 	var incomingCursor *edgeListCursor
 	if cursor != "" {
 		cb, err := base64.StdEncoding.DecodeString(cursor)
 		if err != nil {
-			return nil, ErrGroupUserInvalidCursor
+			return nil, runtime.ErrGroupUserInvalidCursor
 		}
 		incomingCursor = &edgeListCursor{}
 		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(incomingCursor); err != nil {
-			return nil, ErrGroupUserInvalidCursor
+			return nil, runtime.ErrGroupUserInvalidCursor
 		}
 
 		// Cursor and filter mismatch. Perhaps the caller has sent an old cursor with a changed filter.
 		if state != nil && int64(state.Value) != incomingCursor.State {
-			return nil, ErrGroupUserInvalidCursor
+			return nil, runtime.ErrGroupUserInvalidCursor
 		}
 	}
 
@@ -1380,7 +1400,7 @@ WHERE u.id = ge.destination_id AND ge.source_id = $1`
 	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, ErrGroupNotFound
+			return nil, runtime.ErrGroupNotFound
 		}
 
 		logger.Debug("Could not list users in group.", zap.Error(err), zap.String("group_id", groupID.String()))
@@ -1415,7 +1435,7 @@ WHERE u.id = ge.destination_id AND ge.source_id = $1`
 		if err := rows.Scan(&id, &username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata,
 			&apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &edgeCount, &createTime, &updateTime, &state, &position); err != nil {
 			if err == sql.ErrNoRows {
-				return nil, ErrGroupNotFound
+				return nil, runtime.ErrGroupNotFound
 			}
 			logger.Error("Could not parse rows when listing users in a group.", zap.Error(err), zap.String("group_id", groupID.String()))
 			return nil, err
@@ -1448,14 +1468,14 @@ WHERE u.id = ge.destination_id AND ge.source_id = $1`
 			GamecenterId:          gamecenter.String,
 			SteamId:               steam.String,
 			EdgeCount:             int32(edgeCount),
-			CreateTime:            &timestamp.Timestamp{Seconds: createTime.Time.Unix()},
-			UpdateTime:            &timestamp.Timestamp{Seconds: updateTime.Time.Unix()},
-			Online:                tracker.StreamExists(PresenceStream{Mode: StreamModeNotifications, Subject: userID}),
+			CreateTime:            &timestamppb.Timestamp{Seconds: createTime.Time.Unix()},
+			UpdateTime:            &timestamppb.Timestamp{Seconds: updateTime.Time.Unix()},
+			Online:                tracker.StreamExists(PresenceStream{Mode: StreamModeStatus, Subject: userID}),
 		}
 
 		groupUser := &api.GroupUserList_GroupUser{
 			User: user,
-			State: &wrappers.Int32Value{
+			State: &wrapperspb.Int32Value{
 				Value: int32(state.Int64),
 			},
 		}
@@ -1466,21 +1486,21 @@ WHERE u.id = ge.destination_id AND ge.source_id = $1`
 	return &api.GroupUserList{GroupUsers: groupUsers, Cursor: outgoingCursor}, nil
 }
 
-func ListUserGroups(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, limit int, state *wrappers.Int32Value, cursor string) (*api.UserGroupList, error) {
+func ListUserGroups(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, limit int, state *wrapperspb.Int32Value, cursor string) (*api.UserGroupList, error) {
 	var incomingCursor *edgeListCursor
 	if cursor != "" {
 		cb, err := base64.StdEncoding.DecodeString(cursor)
 		if err != nil {
-			return nil, ErrUserGroupInvalidCursor
+			return nil, runtime.ErrUserGroupInvalidCursor
 		}
 		incomingCursor = &edgeListCursor{}
 		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(incomingCursor); err != nil {
-			return nil, ErrUserGroupInvalidCursor
+			return nil, runtime.ErrUserGroupInvalidCursor
 		}
 
 		// Cursor and filter mismatch. Perhaps the caller has sent an old cursor with a changed filter.
 		if state != nil && int64(state.Value) != incomingCursor.State {
-			return nil, ErrUserGroupInvalidCursor
+			return nil, runtime.ErrUserGroupInvalidCursor
 		}
 	}
 
@@ -1517,7 +1537,7 @@ WHERE g.id = ge.destination_id AND ge.source_id = $1`
 	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, ErrGroupNotFound
+			return nil, runtime.ErrGroupNotFound
 		}
 		logger.Debug("Could not list groups for a user.", zap.Error(err), zap.String("user_id", userID.String()))
 		return nil, err
@@ -1575,16 +1595,16 @@ WHERE g.id = ge.destination_id AND ge.source_id = $1`
 			AvatarUrl:   avatarURL.String,
 			LangTag:     lang.String,
 			Metadata:    string(metadata),
-			Open:        &wrappers.BoolValue{Value: open},
+			Open:        &wrapperspb.BoolValue{Value: open},
 			EdgeCount:   int32(edgeCount.Int64),
 			MaxCount:    int32(maxCount.Int64),
-			CreateTime:  &timestamp.Timestamp{Seconds: createTime.Time.Unix()},
-			UpdateTime:  &timestamp.Timestamp{Seconds: updateTime.Time.Unix()},
+			CreateTime:  &timestamppb.Timestamp{Seconds: createTime.Time.Unix()},
+			UpdateTime:  &timestamppb.Timestamp{Seconds: updateTime.Time.Unix()},
 		}
 
 		userGroup := &api.UserGroupList_UserGroup{
 			Group: group,
-			State: &wrappers.Int32Value{
+			State: &wrapperspb.Int32Value{
 				Value: int32(userState.Int64),
 			},
 		}
@@ -1621,7 +1641,7 @@ AND id IN (` + strings.Join(statements, ",") + `)`
 	}
 	// Rows closed in groupConvertRows()
 
-	groups, err := groupConvertRows(rows)
+	groups, err := groupConvertRows(rows, len(ids))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return make([]*api.Group, 0), nil
@@ -1633,7 +1653,15 @@ AND id IN (` + strings.Join(statements, ",") + `)`
 	return groups, nil
 }
 
-func ListGroups(ctx context.Context, logger *zap.Logger, db *sql.DB, name string, limit int, cursorStr string) (*api.GroupList, error) {
+func ListGroups(ctx context.Context, logger *zap.Logger, db *sql.DB, name, langTag string, open *bool, edgeCount, limit int, cursorStr string) (*api.GroupList, error) {
+	if name != "" && (langTag != "" || open != nil || edgeCount > -1) {
+		return nil, StatusError(codes.InvalidArgument, "name filter cannot be combined with any other filter", nil)
+	}
+
+	if name != "" {
+		name = string(bytes.TrimLeft([]byte(name), "% "))
+	}
+
 	var cursor *groupListCursor
 	if cursorStr != "" {
 		cursor = &groupListCursor{}
@@ -1649,48 +1677,141 @@ func ListGroups(ctx context.Context, logger *zap.Logger, db *sql.DB, name string
 	}
 
 	var query string
-	params := []interface{}{limit}
-	if name == "" {
-		query = `
-SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
-FROM groups
-WHERE disable_time = '1970-01-01 00:00:00 UTC'
-ORDER BY lang_tag ASC, edge_count ASC, id ASC
-LIMIT $1`
-		if cursor != nil {
-			params = append(params, cursor.Lang, cursor.EdgeCount, cursor.ID)
-			query = `
-SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
-FROM groups
-WHERE disable_time = '1970-01-01 00:00:00 UTC'
-AND (lang_tag, edge_count, id) > ($2, $3, $4)
-ORDER BY lang_tag ASC, edge_count ASC, id ASC
-LIMIT $1`
-		}
-	} else {
+	params := []interface{}{limit + 1}
+	switch {
+	case name != "":
+		// Filtering by name only.
 		params = append(params, name)
 		query = `
 SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
 FROM groups
-WHERE
-	(disable_time = '1970-01-01 00:00:00 UTC')
-AND
-	(name LIKE $2)
-LIMIT $1`
+WHERE name ILIKE $2`
 		if cursor != nil {
-			params = append(params, cursor.Lang, cursor.EdgeCount, cursor.ID)
-			query = `
+			params = append(params, cursor.Name)
+			query += " AND name > $3"
+		}
+	case open != nil && langTag != "" && edgeCount > -1:
+		// Filtering by open/closed, lang tag, and edge count
+		state := 0
+		if *open {
+			state = 1
+		}
+		params = append(params, state, langTag, edgeCount)
+		query = `
 SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
 FROM groups
-WHERE
-	(disable_time = '1970-01-01 00:00:00 UTC')
-AND
-	(name LIKE $2)
-AND
-	((lang_tag, edge_count, id) > ($3, $4, $5))
-LIMIT $1`
+WHERE disable_time = '1970-01-01 00:00:00 UTC'
+AND state = $2
+AND lang_tag = $3
+AND edge_count <= $4`
+		if cursor != nil {
+			params = append(params, cursor.GetState(), cursor.Lang, cursor.EdgeCount, cursor.ID)
+			query += " AND (disable_time, state, lang_tag, edge_count, id) < ('1970-01-01 00:00:00 UTC', $5, $6, $7, $8)"
 		}
+		query += " ORDER BY disable_time DESC, state DESC, lang_tag DESC, edge_count DESC, id DESC"
+	case open != nil && langTag != "":
+		// Filtering by open/closed and lang tag.
+		state := 0
+		if *open {
+			state = 1
+		}
+		params = append(params, state, langTag)
+		query = `
+SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
+FROM groups
+WHERE disable_time = '1970-01-01 00:00:00 UTC'
+AND state = $2
+AND lang_tag = $3`
+		if cursor != nil {
+			params = append(params, cursor.GetState(), cursor.Lang, cursor.EdgeCount, cursor.ID)
+			query += " AND (disable_time, state, lang_tag, edge_count, id) > ('1970-01-01 00:00:00 UTC', $4, $5, $6, $7)"
+		}
+	case open != nil && edgeCount > -1:
+		// Filtering by open/closed and edge count.
+		state := 0
+		if *open {
+			state = 1
+		}
+		params = append(params, state, edgeCount)
+		query = `
+SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
+FROM groups
+WHERE disable_time = '1970-01-01 00:00:00 UTC'
+AND state = $2
+AND edge_count = $3`
+		if cursor != nil {
+			params = append(params, cursor.GetState(), cursor.EdgeCount, cursor.Lang, cursor.ID)
+			query += " AND (disable_time, state, edge_count, lang_tag, id) < ('1970-01-01 00:00:00 UTC', $4, $5, $6, $7)"
+		}
+		query += " ORDER BY disable_time DESC, state DESC, edge_count DESC, lang_tag DESC, id DESC"
+	case langTag != "" && edgeCount > -1:
+		// Filtering by lang tag and edge count.
+		params = append(params, langTag, edgeCount)
+		query = `
+SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
+FROM groups
+WHERE disable_time = '1970-01-01 00:00:00 UTC'
+AND lang_tag = $2
+AND edge_count <= $3`
+		if cursor != nil {
+			params = append(params, cursor.Lang, cursor.EdgeCount, cursor.ID)
+			query += " AND (disable_time, lang_tag, edge_count, id) < ('1970-01-01 00:00:00 UTC', $4, $5, $6)"
+		}
+		query += " ORDER BY disable_time DESC, lang_tag DESC, edge_count DESC, id DESC"
+	case langTag != "":
+		// Filtering by lang tag only.
+		params = append(params, langTag)
+		query = `
+SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
+FROM groups
+WHERE disable_time = '1970-01-01 00:00:00 UTC'
+AND lang_tag = $2`
+		if cursor != nil {
+			params = append(params, cursor.Lang, cursor.EdgeCount, cursor.ID)
+			query += " AND (disable_time, lang_tag, edge_count, id) > ('1970-01-01 00:00:00 UTC', $3, $4, $5)"
+		}
+	case edgeCount > -1:
+		// Filtering by edge count only.
+		params = append(params, edgeCount)
+		query = `
+SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
+FROM groups
+WHERE disable_time = '1970-01-01 00:00:00 UTC'
+AND edge_count <= $2`
+		if cursor != nil {
+			params = append(params, cursor.EdgeCount, cursor.GetUpdateTime(), cursor.ID)
+			query += " AND (disable_time, edge_count, update_time, id) < ('1970-01-01 00:00:00 UTC', $3, $4, $5)"
+		}
+		query += " ORDER BY disable_time DESC, edge_count DESC, update_time DESC, id DESC"
+	case open != nil:
+		// Filtering by open/closed only.
+		state := 0
+		if *open {
+			state = 1
+		}
+		params = append(params, state)
+		query = `
+SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
+FROM groups
+WHERE disable_time = '1970-01-01 00:00:00 UTC'
+AND state = $2`
+		if cursor != nil {
+			params = append(params, cursor.GetState(), cursor.EdgeCount, cursor.Lang, cursor.ID)
+			query += " AND (disable_time, state, lang_tag, edge_count, id) > ('1970-01-01 00:00:00 UTC', $3, $4, $5, $6)"
+		}
+	default:
+		// No filter.
+		query = `
+SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
+FROM groups
+WHERE disable_time = '1970-01-01 00:00:00 UTC'`
+		if cursor != nil {
+			params = append(params, cursor.GetUpdateTime(), cursor.EdgeCount, cursor.ID)
+			query += " AND (disable_time, update_time, edge_count, id) > ('1970-01-01 00:00:00 UTC', $2, $3, $4)"
+		}
+		query += " ORDER BY disable_time, update_time, edge_count, id"
 	}
+	query += " LIMIT $1"
 
 	groupList := &api.GroupList{Groups: make([]*api.Group, 0)}
 	rows, err := db.QueryContext(ctx, query, params...)
@@ -1701,9 +1822,9 @@ LIMIT $1`
 		logger.Error("Could not list groups.", zap.Error(err), zap.String("name", name))
 		return nil, err
 	}
-	// Rows closed in groupConvertRows()
 
-	groups, err := groupConvertRows(rows)
+	// Rows closed in groupConvertRows()
+	groups, err := groupConvertRows(rows, limit+1)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return groupList, nil
@@ -1712,69 +1833,84 @@ LIMIT $1`
 		return nil, err
 	}
 
+	groupList.Groups = groups[:int(math.Min(float64(len(groups)), float64(limit)))]
+
 	cursorBuf := new(bytes.Buffer)
-	if len(groups) > 0 {
-		lastGroup := groups[len(groups)-1]
+	if len(groups) > limit {
+		lastGroup := groupList.Groups[len(groupList.Groups)-1]
 		newCursor := &groupListCursor{
-			ID:        uuid.Must(uuid.FromString(lastGroup.Id)),
-			EdgeCount: lastGroup.EdgeCount,
-			Lang:      lastGroup.LangTag,
+			ID:         uuid.Must(uuid.FromString(lastGroup.Id)),
+			EdgeCount:  lastGroup.EdgeCount,
+			Lang:       lastGroup.LangTag,
+			Name:       lastGroup.Name,
+			Open:       lastGroup.Open.Value,
+			UpdateTime: lastGroup.UpdateTime.Seconds,
 		}
 		if err := gob.NewEncoder(cursorBuf).Encode(newCursor); err != nil {
 			logger.Error("Could not create new cursor.", zap.Error(err))
 			return nil, err
 		}
-		groupList.Groups = groups
 		groupList.Cursor = base64.RawURLEncoding.EncodeToString(cursorBuf.Bytes())
 	}
 
 	return groupList, nil
 }
 
-func groupConvertRows(rows *sql.Rows) ([]*api.Group, error) {
+type groupSqlStruct struct {
+	id          string
+	creatorID   sql.NullString
+	name        sql.NullString
+	description sql.NullString
+	avatarURL   sql.NullString
+	lang        sql.NullString
+	metadata    []byte
+	state       sql.NullInt64
+	edgeCount   sql.NullInt64
+	maxCount    sql.NullInt64
+	createTime  pgtype.Timestamptz
+	updateTime  pgtype.Timestamptz
+}
+
+func sqlMapper(row *groupSqlStruct) *api.Group {
+	open := true
+	if row.state.Int64 == 1 {
+		open = false
+	}
+	return &api.Group{
+		Id:          uuid.Must(uuid.FromString(row.id)).String(),
+		CreatorId:   uuid.Must(uuid.FromString(row.creatorID.String)).String(),
+		Name:        row.name.String,
+		Description: row.description.String,
+		AvatarUrl:   row.avatarURL.String,
+		LangTag:     row.lang.String,
+		Metadata:    string(row.metadata),
+		Open:        &wrapperspb.BoolValue{Value: open},
+		EdgeCount:   int32(row.edgeCount.Int64),
+		MaxCount:    int32(row.maxCount.Int64),
+		CreateTime:  &timestamppb.Timestamp{Seconds: row.createTime.Time.Unix()},
+		UpdateTime:  &timestamppb.Timestamp{Seconds: row.updateTime.Time.Unix()},
+	}
+}
+
+func convertToGroup(rows *sql.Rows) (*api.Group, error) {
+	s := groupSqlStruct{}
+	groupStruct, fields := &s, []interface{}{&s.id, &s.creatorID, &s.name, &s.description, &s.avatarURL, &s.state, &s.edgeCount, &s.lang,
+		&s.maxCount, &s.metadata, &s.createTime, &s.updateTime}
+	if err := rows.Scan(fields...); err != nil {
+		return nil, err
+	}
+	return sqlMapper(groupStruct), nil
+}
+
+func groupConvertRows(rows *sql.Rows, limit int) ([]*api.Group, error) {
 	defer rows.Close()
-
-	groups := make([]*api.Group, 0, 10)
-
+	groups := make([]*api.Group, 0, limit)
 	for rows.Next() {
-		var id string
-		var creatorID sql.NullString
-		var name sql.NullString
-		var description sql.NullString
-		var avatarURL sql.NullString
-		var lang sql.NullString
-		var metadata []byte
-		var state sql.NullInt64
-		var edgeCount sql.NullInt64
-		var maxCount sql.NullInt64
-		var createTime pgtype.Timestamptz
-		var updateTime pgtype.Timestamptz
-
-		if err := rows.Scan(&id, &creatorID, &name, &description, &avatarURL, &state, &edgeCount, &lang, &maxCount, &metadata, &createTime, &updateTime); err != nil {
+		if group, err := convertToGroup(rows); err != nil {
 			return nil, err
+		} else {
+			groups = append(groups, group)
 		}
-
-		open := true
-		if state.Int64 == 1 {
-			open = false
-		}
-
-		group := &api.Group{
-			Id:          uuid.Must(uuid.FromString(id)).String(),
-			CreatorId:   uuid.Must(uuid.FromString(creatorID.String)).String(),
-			Name:        name.String,
-			Description: description.String,
-			AvatarUrl:   avatarURL.String,
-			LangTag:     lang.String,
-			Metadata:    string(metadata),
-			Open:        &wrappers.BoolValue{Value: open},
-			EdgeCount:   int32(edgeCount.Int64),
-			MaxCount:    int32(maxCount.Int64),
-			CreateTime:  &timestamp.Timestamp{Seconds: createTime.Time.Unix()},
-			UpdateTime:  &timestamp.Timestamp{Seconds: updateTime.Time.Unix()},
-		}
-
-		groups = append(groups, group)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1979,5 +2115,41 @@ WHERE group_edge.destination_id = $1`
 		}
 	}
 
+	return nil
+}
+
+func getGroup(ctx context.Context, logger *zap.Logger, db *sql.DB, groupID uuid.UUID) (*api.Group, error) {
+	query := `SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
+	FROM groups WHERE id = $1`
+
+	s := groupSqlStruct{}
+	groupStruct, fields := &s, []interface{}{&s.id, &s.creatorID, &s.name, &s.description, &s.avatarURL, &s.state, &s.edgeCount, &s.lang,
+		&s.maxCount, &s.metadata, &s.createTime, &s.updateTime}
+
+	if err := db.QueryRowContext(ctx, query, groupID).Scan(fields...); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, runtime.ErrGroupNotFound
+		}
+		logger.Error("Error retrieving group.", zap.Error(err))
+		return nil, err
+	}
+	return sqlMapper(groupStruct), nil
+}
+
+func incrementGroupEdge(ctx context.Context, logger *zap.Logger, tx *sql.Tx, uid uuid.UUID, groupID uuid.UUID) error {
+	query := "UPDATE groups SET edge_count = edge_count + 1, update_time = now() WHERE id = $1::UUID AND edge_count+1 <= max_count"
+	res, err := tx.ExecContext(ctx, query, groupID)
+	if err != nil {
+		logger.Debug("Could not update group edge_count.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()), zap.Error(err))
+		return err
+	}
+
+	if rowsAffected, err := res.RowsAffected(); err != nil {
+		logger.Debug("Could not retrieve affect rows.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()), zap.Error(err))
+		return err
+	} else if rowsAffected == 0 {
+		logger.Debug("Did not update group edge count - check edge count has not reached max count.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
+		return runtime.ErrGroupFull
+	}
 	return nil
 }

@@ -18,19 +18,21 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/heroiclabs/nakama/v3/internal/gopher-lua"
+	lua "github.com/heroiclabs/nakama/v3/internal/gopher-lua"
 )
 
 const (
 	__RUNTIME_LUA_CTX_ENV              = "env"
 	__RUNTIME_LUA_CTX_MODE             = "execution_mode"
 	__RUNTIME_LUA_CTX_NODE             = "node"
+	__RUNTIME_LUA_CTX_HEADERS          = "headers"
 	__RUNTIME_LUA_CTX_QUERY_PARAMS     = "query_params"
 	__RUNTIME_LUA_CTX_USER_ID          = "user_id"
 	__RUNTIME_LUA_CTX_USERNAME         = "username"
 	__RUNTIME_LUA_CTX_VARS             = "vars"
 	__RUNTIME_LUA_CTX_USER_SESSION_EXP = "user_session_exp"
 	__RUNTIME_LUA_CTX_SESSION_ID       = "session_id"
+	__RUNTIME_LUA_CTX_LANG             = "lang"
 	__RUNTIME_LUA_CTX_CLIENT_IP        = "client_ip"
 	__RUNTIME_LUA_CTX_CLIENT_PORT      = "client_port"
 	__RUNTIME_LUA_CTX_MATCH_ID         = "match_id"
@@ -39,7 +41,7 @@ const (
 	__RUNTIME_LUA_CTX_MATCH_TICK_RATE  = "match_tick_rate"
 )
 
-func NewRuntimeLuaContext(l *lua.LState, node string, env *lua.LTable, mode RuntimeExecutionMode, queryParams map[string][]string, sessionExpiry int64, userID, username string, vars map[string]string, sessionID, clientIP, clientPort string) *lua.LTable {
+func NewRuntimeLuaContext(l *lua.LState, node string, env *lua.LTable, mode RuntimeExecutionMode, headers, queryParams map[string][]string, sessionExpiry int64, userID, username string, vars map[string]string, sessionID, clientIP, clientPort, lang string) *lua.LTable {
 	size := 3
 	if userID != "" {
 		size += 3
@@ -59,6 +61,11 @@ func NewRuntimeLuaContext(l *lua.LState, node string, env *lua.LTable, mode Runt
 	lt.RawSetString(__RUNTIME_LUA_CTX_ENV, env)
 	lt.RawSetString(__RUNTIME_LUA_CTX_MODE, lua.LString(mode.String()))
 	lt.RawSetString(__RUNTIME_LUA_CTX_NODE, lua.LString(node))
+	if headers == nil {
+		lt.RawSetString(__RUNTIME_LUA_CTX_HEADERS, l.CreateTable(0, 0))
+	} else {
+		lt.RawSetString(__RUNTIME_LUA_CTX_HEADERS, RuntimeLuaConvertValue(l, headers))
+	}
 	if queryParams == nil {
 		lt.RawSetString(__RUNTIME_LUA_CTX_QUERY_PARAMS, l.CreateTable(0, 0))
 	} else {
@@ -78,6 +85,8 @@ func NewRuntimeLuaContext(l *lua.LState, node string, env *lua.LTable, mode Runt
 		lt.RawSetString(__RUNTIME_LUA_CTX_USER_SESSION_EXP, lua.LNumber(sessionExpiry))
 		if sessionID != "" {
 			lt.RawSetString(__RUNTIME_LUA_CTX_SESSION_ID, lua.LString(sessionID))
+			// Lang is never reported without session ID.
+			lt.RawSetString(__RUNTIME_LUA_CTX_LANG, lua.LString(lang))
 		}
 	}
 
@@ -224,6 +233,8 @@ func RuntimeLuaConvertLuaValue(lv lua.LValue) interface{} {
 			ret = append(ret, RuntimeLuaConvertLuaValue(v.RawGetInt(i)))
 		}
 		return ret
+	case *lua.LFunction:
+		return v.String()
 	default:
 		return v
 	}

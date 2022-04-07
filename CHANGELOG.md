@@ -4,8 +4,242 @@ All notable changes to this project are documented below.
 The format is based on [keep a changelog](http://keepachangelog.com) and this project uses [semantic versioning](http://semver.org).
 
 ## [Unreleased]
+### Changed
+- Ensure storage write ops return acks in the same order as inputs.
 
 ### Fixed
+- Fix data returned by StreamUserList in JS runtime.
+- Allow passing lists of presences as match init parameters to Go runtime matches.
+- Fix devconsole counts when database statistics are not available.
+- Generate missing username in runtime token generator.
+- Improve JS runtime authoritative match filtered broadcasts to large sets of users.
+
+## [3.11.0] - 2022-03-21
+### Added
+- Add "GroupUsersBan" function to all runtimes.
+- Add "LeaderboardRecordsHaystack" to all runtimes.
+- Add Groups page and API endpoints to the developer console.
+- Add "NotificationSendAll" function to the runtimes, for sending a notification to all users.
+- Log a warning when client IP address cannot be resolved.
+- Add matchmaker option to enforce a multiple of resulting matched count.
+- Add tagged Prometheus stats containing RPC function identifiers.
+
+### Changed
+- Improve Stackdriver log format timestamp and message field formats.
+- Use crypto random to seed global random instance if possible.
+- Allow migrate subcommand to use database names that contain dashes.
+- Add senderID param to "channelIdBuild" function.
+- Improve leaderboard rank cache population at startup.
+- JavaScript global variables are made immutable by default after the "InitModule" function is invoked.
+- Return system user UUID string in "StorageWrite" acks for all runtimes.
+- Realtime after hooks now include both the outgoing and incoming payload.
+- Realtime after hooks do not run when the operation fails.
+- Build with Go 1.18.0 release.
+
+### Fixed
+- Fix the registered function name for "nk.channelIdBuild" in the JavaScript runtime.
+- Better input validation for Steam link operations.
+- Fix incorrect link device behaviour in JavaScript runtime.
+- Fix JavaScript runtime multi-update execution consistency when part of the operation fails.
+- Fix handling of wallet ledger lookups with no limit during account exports.
+- Ensure maximum count is accounted for in matchmaker mutual match checks.
+- Ensure the matchmaker always correctly prefers matches closer to the maximum count.
+
+## [3.10.0] - 2021-12-16
+### Added
+- Add ctx field to access http request headers in the runtimes.
+- New JS runtime stringToBinary and binaryToString functions.
+- New configuration option for frequency of database DNS change scans.
+
+### Changed
+- Set JavaScript runtime custom error message as the returned payload message in RPC requests.
+- JavaScript runtime match data changed to use Uint8Array type.
+- Update Tally, and transitive dependencies to resolve dynamic linker error in xxhash package.
+- Build with Go 1.17.5 release.
+
+### Fixed
+- Gracefully close Lua matches when call queue fills up.
+- Better handling for Lua runtime wallet update operation errors.
+- Fix handling of leaderboard record writes that do not need to update the database.
+- Fix parsing edge case in TypeScript/JavaScript runtime storage delete operations.
+- Better handling of leaderboard and tournament score submissions that result in no score change.
+- Named match creation now returns existing presences if the name mapped to an existing match.
+
+## [3.9.0] - 2021-10-29
+### Added
+- Allow creation of relayed matches with a name. Names will be mapped to match identifiers.
+- Expose Nakama errors to the server runtime.
+- The wallet ledger view in the Nakama Console now supports pagination.
+
+### Changed
+- Periodically check database hostname for underlying address changes more frequently.
+- Upgrade GRPC, GRPC-Gateway, Protobuf, PGX, and other dependencies.
+
+### Fixed
+- Fix optimistic email imports when linking social profiles.
+- Fix error on API group update name already taken.
+
+## [3.8.0] - 2021-10-15
+### Added
+- Add final notification sent to sockets closed via single socket option.
+- Add match signal function to server framework.
+- Add node status icons to the console dashboard.
+
+### Changed
+- Build with Go 1.17.2 release.
+- Match handlers are now required to implement a signal handler function.
+
+  Match signals allow the match handler to be sent a reservation signal to mark a user ID or session ID into the match state ahead of their join attempt and eventual join flow. This is useful to apply reservations to a matchmaking system with Nakama's matchmaker or match listings APIs.
+
+- Log status follow missing users at debug instead of warn level.
+
+### Fixed
+- Fix input validation edge case in group listing operations.
+
+## [3.7.0] - 2021-09-28
+### Added
+- New config options to enforce a single socket per user, and a single match per socket.
+
+### Changed
+- Build with Go 1.17.1 release.
+- Allow tournament creation operations to set the authoritative flag.
+- Update to nakama-common 1.18.0 release.
+
+## [3.6.0] - 2021-09-09
+### Added
+- More informational logging when groups are created, updated, or deleted.
+- Add "ChannelMessageUpdate" function to server framework.
+- New config option to toggle Lua runtime error stacktraces returned to clients.
+
+### Changed
+- Use the Facebook Graph API v11.0 version.
+- Defer Facebook email import execution to after account creation.
+- Improve encode/decode check in authoritative match creation parameters.
+- Warn when using deprecated config parameters.
+- Improve email import semantics when linking social accounts.
+- Log IAP provider API response payload when non 200 status code is returned.
+- Better handling of storage operations where OCC is not required.
+- Default ledger updates to false in "walletsUpdate" function in the JavaScript/Lua runtimes. Same as how Go usage works.
+- Build with Go 1.17.0 release.
+- Purchase validation functions now return a flag indicating if valid purchases are new or resubmitted.
+- Adjust Lua runtime pool allocation startup logs.
+
+### Fixed
+- Fix log level in Lua runtime log calls which use structured logger fields.
+- Register purchase validation before/after hooks in JavaScript/Lua runtimes.
+- Register "DemoteGroupUsers" before/after hooks in the JavaScript runtime.
+- Add missing "environment" to JavaScript ValidatedPurchases type.
+- Fix typos in error messages which mention empty input values.
+- Fix resolution of exported time and latency metrics.
+- Optimize tournament lookup operations.
+- Fix "groupUpdate" function incorrect parsing of "open" argument in the Lua runtime.
+- List JavaScript modules if loaded from the default entrypoint in the Console.
+
+## [3.5.0] - 2021-08-10
+### Added
+- Handle thrown JS runtime custom exceptions containing a message and a grpc code to be returned in the server response.
+- Add function to retrieve a random set of users to server framework.
+- Add ChannelMessageSend function to server framework.
+- Add BuildChannelId function to server framework.
+
+### Changed
+- Apple Sign-In is now supported across both Web and mobile tokens.
+- Status messages can now be up to 2048 characters (increased from 128 characters).
+- Improved SQL used in unfiltered group listings queries.
+- Throw error instead of panic when attempting to create a group with the system user.
+- Add userId field for permission check in JavaScript/Lua runtimes groupUpdate functions.
+- Allow standard space characters in usernames for direct compatibility with Steam display names.
+- Build with Go 1.16.7 release.
+- Allow batch-only leaderboard and tournament score lookups from the server framework.
+- Return a better error message when single input wallet updates are performed for a user which does not exist.
+- Update to newer Apple guidelines on Game Center root certificate validation in authentication.
+
+### Fixed
+- Fix creator id being read from the wrong argument in JavaScript runtime groupUpdate function.
+- Fix max count being incorrectly validated in groupUpdate JavaScript runtime function.
+- Fix error handling when attempting to write records to a tournament that does not exist.
+- Fix JavaScript runtime missing fields from leaderboards/tournaments get, list, and write functions.
+- Fix JavaScript runtime ownerId field bad parsing in leaderboard/tournament records list functions.
+- Fix parameter usage in leaderboard score set operator.
+- Fix JavaScript runtime storageList not returning a cursor.
+
+## [3.4.0] - 2021-07-08
+### Added
+- Add new groupsList runtime function.
+- Add runtime leaderboardList and leaderboardsGetId functions.
+- Add leaderboard/tournament prev_reset field.
+- Add custom metrics runtime functions for counters, gauges, and timers.
+- Add optional override for runtime Apple IAP validation function.
+- Add socket lang parameter to Go runtime contexts.
+
+### Changed
+- Include ticket in party matchmaker add operation responses.
+- Build with Go 1.16.5 release.
+- Replace Bleve gtreap in-memory store implementation with a more compact version.
+- Users kicked from parties now receive a party close event.
+- Log recovered panics in HTTP handler functions at error level rather than info.
+- Add new langTag, members and open filters to the group listing API.
+- Upgrade pgx to v4 for improved SQL performance.
+- Update RegisterLeaderboardReset runtime function signature.
+- Cancel runtime context when graceful shutdown completes.
+- Add button to Nakama Console UI to allow device IDs to be copied.
+- Improve runtime single wallet update error results.
+
+### Fixed
+- Ensure all members are correctly listed in party info when there are multiple concurrent successful joins.
+- Correctly set party ID in matchmaker matched callback input.
+- Send Party close messages only where appropriate.
+- Fix TypeScript/JavaScript match dispatcher presence list validation.
+- Fix JavaScript/Lua friendsList incorrect returned values.
+
+## [3.3.0] - 2021-05-17
+### Added
+- Tournaments and leaderboards now allow operator scoring to be passed in on updates.
+- Tournaments and leaderboards now support decrement score operator.
+- Add "rpc_id" and "api_id" to the structured logger output in API calls.
+
+### Changed
+- Store email, avatar URL, and display name provided by Apple, Facebook, and Google login providers if empty.
+- Change runtime group add/kick/promote/demote APIs to include optional callerID parameter for permission checking. If the caller ID is an empty string it defaults to the system user.
+- Default to use SSL mode "prefer" in database connections.
+
+### Fixed
+- Fix reading Lua authoritative match states that contain functions.
+- Fix reading JS/TS authoritative match states that contain functions.
+- Use UNIX path representation for embedded migrations and console files on Windows systems.
+- Update Lua VM implementation to resolve nil reference caused after a VM registry resize.
+- Pointerize slice and map types when passed into the JS VM so that they're mutated by reference.
+- Fix off by one error in leaderboard records returned by "around owner" queries.
+- Return null from within JS VM GetMatch function if match does not exist.
+
+## [3.2.1] - 2021-04-19
+### Changed
+- A user's online indicator now observes the status mode rather than just socket connectivity.
+- Update sql-migrate library to a32ed26.
+- Rework some migrations for better compatibility with different database engines.
+- Update to Protobuf v1.5.2, GRPC v1.37.0, and GRPC-Gateway v2.3.0 releases.
+- Update to Bleve v2.0.3 release.
+- Various other dependency updates.
+
+### Fixed
+- Fix user scoping in Nakama Console purchase listing view.
+
+## [3.2.0] - 2021-04-14
+### Added
+- New API to logout and intercept logouts with session and refresh tokens.
+- Add a leave reason to presence events to handle transient disconnects more easily.
+- New API for IAP validation with Apple App Store, Google Play Store, and Huawei AppGallery.
+
+### Changed
+- Improve struct field alignment on types in the social package.
+- Improve memory re-use within the matchmaker and match registry structures.
+- Support Facebook Limited Login tokens received into the standard Facebook login/link/unlink functions.
+- Update JS VM to newer version. This resolves an issue with resizing some JS arrays.
+- Build with Go 1.16.3 release.
+
+### Fixed
+- Matchmaker entries which were only partially matched together could not combine with larger player counts.
+- Fix bad inputs parsed in some before/after hook executions made from the API Explorer in the Console.
 - Correctly return Unix timestamps in JS runtime functions returning users/accounts data.
 
 ## [3.1.2] - 2021-03-03
@@ -22,7 +256,7 @@ The format is based on [keep a changelog](http://keepachangelog.com) and this pr
 - Fix an issue in the JS runtime that would prevent the matchmaker matched callback to function correctly.
 - Allow the console API to return large responses based on the configured max message size.
 - Allow JS runtime initializer functions to be invoked inside a try/catch block.
-- Fix Tournament Reset function hook schedules calcuated on first write if the end active time must be computed with no reset schedule.
+- Fix Tournament Reset function hook schedules calculated on first write if the end active time must be computed with no reset schedule.
 
 ## [3.1.1] - 2021-02-15
 ### Changed

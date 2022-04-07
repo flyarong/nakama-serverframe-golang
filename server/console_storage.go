@@ -25,14 +25,14 @@ import (
 	"sync/atomic"
 
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/empty"
-	"github.com/golang/protobuf/ptypes/timestamp"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
-	"github.com/jackc/pgx/pgtype"
+	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type consoleStorageCursor struct {
@@ -44,16 +44,16 @@ type consoleStorageCursor struct {
 
 var collectionSetCache = &atomic.Value{}
 
-func (s *ConsoleServer) DeleteStorage(ctx context.Context, in *empty.Empty) (*empty.Empty, error) {
+func (s *ConsoleServer) DeleteStorage(ctx context.Context, in *emptypb.Empty) (*emptypb.Empty, error) {
 	_, err := s.db.ExecContext(ctx, "TRUNCATE TABLE storage")
 	if err != nil {
 		s.logger.Error("Failed to truncate Storage table.", zap.Error(err))
 		return nil, status.Error(codes.Internal, "An error occurred while deleting storage objects.")
 	}
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (s *ConsoleServer) DeleteStorageObject(ctx context.Context, in *console.DeleteStorageObjectRequest) (*empty.Empty, error) {
+func (s *ConsoleServer) DeleteStorageObject(ctx context.Context, in *console.DeleteStorageObjectRequest) (*emptypb.Empty, error) {
 	if in.Collection == "" {
 		return nil, status.Error(codes.InvalidArgument, "Requires a valid collection.")
 	}
@@ -86,7 +86,7 @@ func (s *ConsoleServer) DeleteStorageObject(ctx context.Context, in *console.Del
 		return nil, err
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 func (s *ConsoleServer) GetStorage(ctx context.Context, in *api.ReadStorageObjectId) (*api.StorageObject, error) {
@@ -115,7 +115,7 @@ func (s *ConsoleServer) GetStorage(ctx context.Context, in *api.ReadStorageObjec
 	return objects.Objects[0], nil
 }
 
-func (s *ConsoleServer) ListStorageCollections(ctx context.Context, in *empty.Empty) (*console.StorageCollectionsList, error) {
+func (s *ConsoleServer) ListStorageCollections(ctx context.Context, in *emptypb.Empty) (*console.StorageCollectionsList, error) {
 	collectionSetCache := collectionSetCache.Load()
 	if collectionSetCache == nil {
 		return &console.StorageCollectionsList{
@@ -257,9 +257,21 @@ func (s *ConsoleServer) ListStorage(ctx context.Context, in *console.ListStorage
 
 	objects := make([]*api.StorageObject, 0, defaultLimit)
 	var nextCursor *consoleStorageCursor
+	var previousObj *api.StorageObject
 
 	for rows.Next() {
-		o := &api.StorageObject{CreateTime: &timestamp.Timestamp{}, UpdateTime: &timestamp.Timestamp{}}
+		// Check limit before processing for the use case where (last page == limit) => null cursor.
+		if limit > 0 && len(objects) >= limit {
+			nextCursor = &consoleStorageCursor{
+				Key:        previousObj.Key,
+				UserID:     uuid.FromStringOrNil(previousObj.UserId),
+				Collection: previousObj.Collection,
+				Read:       previousObj.PermissionRead,
+			}
+			break
+		}
+
+		o := &api.StorageObject{CreateTime: &timestamppb.Timestamp{}, UpdateTime: &timestamppb.Timestamp{}}
 		var createTime pgtype.Timestamptz
 		var updateTime pgtype.Timestamptz
 
@@ -273,15 +285,7 @@ func (s *ConsoleServer) ListStorage(ctx context.Context, in *console.ListStorage
 		o.UpdateTime.Seconds = updateTime.Time.Unix()
 
 		objects = append(objects, o)
-		if limit > 0 && len(objects) >= limit {
-			nextCursor = &consoleStorageCursor{
-				Key:        o.Key,
-				UserID:     uuid.FromStringOrNil(o.UserId),
-				Collection: o.Collection,
-				Read:       o.PermissionRead,
-			}
-			break
-		}
+		previousObj = o
 	}
 	_ = rows.Close()
 
@@ -372,7 +376,8 @@ func countDatabase(ctx context.Context, logger *zap.Logger, db *sql.DB, tableNam
 			return 0
 		}
 	}
-	if count.Valid && count.Int64 != 0 {
+	// It may return -1 if there are no statistics collected (PG14)
+	if count.Valid && count.Int64 > 0 {
 		// Use this count result.
 		return int32(count.Int64)
 	}
@@ -385,12 +390,12 @@ func countDatabase(ctx context.Context, logger *zap.Logger, db *sql.DB, tableNam
 			return 0
 		}
 	}
-	if count.Valid && count.Int64 != 0 {
+	if count.Valid && count.Int64 > 0 {
 		// Use this count result.
 		return int32(count.Int64)
 	}
 
-	// If both fast counts failed, returned NULL, or returned 0 try a full count.
+	// If both fast counts failed, returned NULL, returned 0 or -1 try a full count.
 	// NOTE: PostgreSQL parses the expression count(*) as a special case taking no
 	// arguments, while count(1) takes an argument and PostgreSQL has to check that
 	// 1 is indeed still not NULL for every row.

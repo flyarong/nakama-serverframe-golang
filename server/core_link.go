@@ -17,15 +17,17 @@ package server
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"strconv"
+	"strings"
+
 	"github.com/gofrs/uuid"
 	"github.com/heroiclabs/nakama/v3/social"
-	"github.com/jackc/pgx"
+	"github.com/jackc/pgconn"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"strconv"
-	"strings"
 )
 
 func LinkApple(ctx context.Context, logger *zap.Logger, db *sql.DB, config Config, socialClient *social.Client, userID uuid.UUID, token string) error {
@@ -44,7 +46,7 @@ func LinkApple(ctx context.Context, logger *zap.Logger, db *sql.DB, config Confi
 	}
 
 	res, err := db.ExecContext(ctx, `
-UPDATE users
+UPDATE users AS u
 SET apple_id = $2, update_time = now()
 WHERE (id = $1)
 AND (NOT EXISTS
@@ -59,6 +61,20 @@ AND (NOT EXISTS
 		return status.Error(codes.Internal, "Error while trying to link Apple ID.")
 	} else if count, _ := res.RowsAffected(); count == 0 {
 		return status.Error(codes.AlreadyExists, "Apple ID is already in use.")
+	}
+
+	// Import email address, if it exists.
+	if profile.Email != "" {
+		_, err = db.ExecContext(ctx, "UPDATE users SET email = $1 WHERE id = $2", profile.Email, userID)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "users_email_key") {
+				logger.Warn("Skipping apple account email import as it is already set in another user.", zap.Error(err), zap.String("appleID", profile.ID), zap.String("user_id", userID.String()))
+			} else {
+				logger.Error("Failed to import apple account email.", zap.Error(err), zap.String("appleID", profile.ID), zap.String("user_id", userID.String()))
+				return status.Error(codes.Internal, "Error importing apple account email.")
+			}
+		}
 	}
 
 	return nil
@@ -119,7 +135,8 @@ func LinkDevice(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid
 		if dbDeviceIDLinkedUser == 0 {
 			_, err = tx.ExecContext(ctx, "INSERT INTO user_device (id, user_id) VALUES ($1, $2)", deviceID, userID)
 			if err != nil {
-				if e, ok := err.(pgx.PgError); ok && e.Code == dbErrorUniqueViolation {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
 					return StatusError(codes.AlreadyExists, "Device ID already in use.", err)
 				}
 				logger.Debug("Cannot link device ID.", zap.Error(err), zap.Any("input", deviceID))
@@ -202,21 +219,35 @@ func LinkFacebook(ctx context.Context, logger *zap.Logger, db *sql.DB, socialCli
 	}
 
 	res, err := db.ExecContext(ctx, `
-UPDATE users
-SET facebook_id = $2, update_time = now()
+UPDATE users AS u
+SET facebook_id = $2, display_name = COALESCE(NULLIF(u.display_name, ''), $3), avatar_url = COALESCE(NULLIF(u.avatar_url, ''), $4), update_time = now()
 WHERE (id = $1)
 AND (NOT EXISTS
     (SELECT id
      FROM users
      WHERE facebook_id = $2 AND NOT id = $1))`,
 		userID,
-		facebookProfile.ID)
+		facebookProfile.ID, facebookProfile.Name, facebookProfile.Picture.Data.Url)
 
 	if err != nil {
 		logger.Error("Could not link Facebook ID.", zap.Error(err), zap.Any("input", token))
 		return status.Error(codes.Internal, "Error while trying to link Facebook ID.")
 	} else if count, _ := res.RowsAffected(); count == 0 {
 		return status.Error(codes.AlreadyExists, "Facebook ID is already in use.")
+	}
+
+	// Import email address, if it exists.
+	if facebookProfile.Email != "" {
+		_, err = db.ExecContext(ctx, "UPDATE users SET email = $1 WHERE id = $2", facebookProfile.Email, userID)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "users_email_key") {
+				logger.Warn("Skipping facebook account email import as it is already set in another user.", zap.Error(err), zap.String("facebookID", facebookProfile.ID), zap.String("username", username), zap.String("user_id", userID.String()))
+			} else {
+				logger.Error("Failed to import facebook account email.", zap.Error(err), zap.String("facebookID", facebookProfile.ID), zap.String("username", username), zap.String("user_id", userID.String()))
+				return status.Error(codes.Internal, "Error importing facebook account email.")
+			}
+		}
 	}
 
 	// Import friends if requested.
@@ -325,8 +356,8 @@ func LinkGoogle(ctx context.Context, logger *zap.Logger, db *sql.DB, socialClien
 	}
 
 	res, err := db.ExecContext(ctx, `
-UPDATE users
-SET google_id = $2, display_name = $3, avatar_url = $4, update_time = now()
+UPDATE users AS u
+SET google_id = $2, display_name = COALESCE(NULLIF(u.display_name, ''), $3), avatar_url = COALESCE(NULLIF(u.avatar_url, ''), $4), update_time = now()
 WHERE (id = $1)
 AND (NOT EXISTS
     (SELECT id
@@ -341,6 +372,21 @@ AND (NOT EXISTS
 	} else if count, _ := res.RowsAffected(); count == 0 {
 		return status.Error(codes.AlreadyExists, "Google ID is already in use.")
 	}
+
+	// Import email address, if it exists.
+	if googleProfile.Email != "" {
+		_, err = db.ExecContext(ctx, "UPDATE users SET email = $1 WHERE id = $2", googleProfile.Email, userID)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "users_email_key") {
+				logger.Warn("Skipping google account email import as it is already set in another user.", zap.Error(err), zap.String("googleID", googleProfile.Sub), zap.String("created_user_id", userID.String()))
+			} else {
+				logger.Error("Failed to import google account email.", zap.Error(err), zap.String("googleID", googleProfile.Sub), zap.String("created_user_id", userID.String()))
+				return status.Error(codes.Internal, "Error importing google account email.")
+			}
+		}
+	}
+
 	return nil
 }
 

@@ -20,19 +20,19 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
+	"github.com/heroiclabs/nakama-common/runtime"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/empty"
-	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/heroiclabs/nakama-common/api"
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-func (s *ApiServer) JoinTournament(ctx context.Context, in *api.JoinTournamentRequest) (*empty.Empty, error) {
+func (s *ApiServer) JoinTournament(ctx context.Context, in *api.JoinTournamentRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
 	username := ctx.Value(ctxUsernameKey{}).(string)
 
@@ -62,11 +62,11 @@ func (s *ApiServer) JoinTournament(ctx context.Context, in *api.JoinTournamentRe
 	tournamentID := in.GetTournamentId()
 
 	if err := TournamentJoin(ctx, s.logger, s.db, s.leaderboardCache, userID.String(), username, tournamentID); err != nil {
-		if err == ErrTournamentNotFound {
+		if err == runtime.ErrTournamentNotFound {
 			return nil, status.Error(codes.NotFound, "Tournament not found.")
-		} else if err == ErrTournamentMaxSizeReached {
+		} else if err == runtime.ErrTournamentMaxSizeReached {
 			return nil, status.Error(codes.InvalidArgument, "Tournament cannot be joined as it has reached its max size.")
-		} else if err == ErrTournamentOutsideDuration {
+		} else if err == runtime.ErrTournamentOutsideDuration {
 			return nil, status.Error(codes.InvalidArgument, "Tournament is not active and cannot accept new joins.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to join tournament.")
@@ -82,7 +82,7 @@ func (s *ApiServer) JoinTournament(ctx context.Context, in *api.JoinTournamentRe
 		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 func (s *ApiServer) ListTournamentRecords(ctx context.Context, in *api.ListTournamentRecordsRequest) (*api.TournamentRecordList, error) {
@@ -121,14 +121,14 @@ func (s *ApiServer) ListTournamentRecords(ctx context.Context, in *api.ListTourn
 		}
 	}
 
-	var limit *wrappers.Int32Value
+	var limit *wrapperspb.Int32Value
 	if in.GetLimit() != nil {
 		if in.GetLimit().Value < 1 || in.GetLimit().Value > 100 {
 			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 100.")
 		}
 		limit = in.GetLimit()
 	} else if len(in.GetOwnerIds()) == 0 || in.GetCursor() == "" {
-		limit = &wrappers.Int32Value{Value: 10}
+		limit = &wrapperspb.Int32Value{Value: 10}
 	}
 
 	overrideExpiry := int64(0)
@@ -137,9 +137,9 @@ func (s *ApiServer) ListTournamentRecords(ctx context.Context, in *api.ListTourn
 	}
 
 	recordList, err := TournamentRecordsList(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.GetTournamentId(), in.OwnerIds, limit, in.Cursor, overrideExpiry)
-	if err == ErrTournamentNotFound {
+	if err == runtime.ErrTournamentNotFound {
 		return nil, status.Error(codes.NotFound, "Tournament not found.")
-	} else if err == ErrTournamentOutsideDuration {
+	} else if err == runtime.ErrTournamentOutsideDuration {
 		return nil, status.Error(codes.NotFound, "Tournament has ended.")
 	} else if err == ErrLeaderboardInvalidCursor {
 		return nil, status.Error(codes.InvalidArgument, "Cursor is invalid or expired.")
@@ -299,15 +299,17 @@ func (s *ApiServer) WriteTournamentRecord(ctx context.Context, in *api.WriteTour
 		return nil, status.Error(codes.NotFound, "Tournament not found or has ended.")
 	}
 
-	record, err := TournamentRecordWrite(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.GetTournamentId(), userID, username, in.GetRecord().GetScore(), in.GetRecord().GetSubscore(), in.GetRecord().GetMetadata())
+	record, err := TournamentRecordWrite(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, userID, in.GetTournamentId(), userID, username, in.GetRecord().GetScore(), in.GetRecord().GetSubscore(), in.GetRecord().GetMetadata(), in.GetRecord().GetOperator())
 	if err != nil {
-		if err == ErrTournamentMaxSizeReached {
+		if err == runtime.ErrTournamentMaxSizeReached {
 			return nil, status.Error(codes.FailedPrecondition, "Tournament has reached max size.")
-		} else if err == ErrTournamentWriteMaxNumScoreReached {
+		} else if err == runtime.ErrTournamentAuthoritative {
+			return nil, status.Error(codes.PermissionDenied, "Tournament only allows authoritative score submissions.")
+		} else if err == runtime.ErrTournamentWriteMaxNumScoreReached {
 			return nil, status.Error(codes.FailedPrecondition, "Reached allowed max number of score attempts.")
-		} else if err == ErrTournamentWriteJoinRequired {
+		} else if err == runtime.ErrTournamentWriteJoinRequired {
 			return nil, status.Error(codes.FailedPrecondition, "Must join tournament before attempting to write value.")
-		} else if err == ErrTournamentOutsideDuration {
+		} else if err == runtime.ErrTournamentOutsideDuration {
 			return nil, status.Error(codes.FailedPrecondition, "Tournament is not active and cannot accept new scores.")
 		} else {
 			return nil, status.Error(codes.Internal, "Error writing score to tournament.")

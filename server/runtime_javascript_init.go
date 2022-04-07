@@ -20,9 +20,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dop251/goja/ast"
-
 	"github.com/dop251/goja"
+	"github.com/dop251/goja/ast"
 	"go.uber.org/zap"
 )
 
@@ -57,6 +56,7 @@ type jsMatchHandlers struct {
 	leaveFn       string
 	loopFn        string
 	terminateFn   string
+	signalFn      string
 }
 
 type RuntimeJavascriptCallbacks struct {
@@ -300,12 +300,10 @@ func (im *RuntimeJavascriptInitModule) extractRpcFn(r *goja.Runtime, rpcFnName s
 func (im *RuntimeJavascriptInitModule) getRpcFnIdentifier(r *goja.Runtime, bs *ast.BlockStatement, initFnVarName, rpcFnName string) (string, error) {
 	for _, exp := range bs.List {
 		if try, ok := exp.(*ast.TryStatement); ok {
-			if tryBs, ok := try.Body.(*ast.BlockStatement); ok {
-				if s, err := im.getRpcFnIdentifier(r, tryBs, initFnVarName, rpcFnName); err != nil {
-					continue
-				} else {
-					return s, nil
-				}
+			if s, err := im.getRpcFnIdentifier(r, try.Body, initFnVarName, rpcFnName); err != nil {
+				continue
+			} else {
+				return s, nil
 			}
 		}
 		if expStat, ok := exp.(*ast.ExpressionStatement); ok {
@@ -936,17 +934,15 @@ func (im *RuntimeJavascriptInitModule) extractHookFn(registerFnName string) (str
 
 func (im *RuntimeJavascriptInitModule) getInitModuleFn() (*ast.BlockStatement, string, error) {
 	var fl *ast.FunctionLiteral
-	for _, dec := range im.ast.DeclarationList {
-		if varDec, ok := dec.(*ast.VariableDeclaration); ok {
-			fnl, ok := varDec.List[0].Initializer.(*ast.FunctionLiteral)
-			if ok && varDec.List[0].Name.String() == INIT_MODULE_FN_NAME {
-				fl = fnl
-				break
-			}
-		} else if fd, ok := dec.(*ast.FunctionDeclaration); ok {
-			if fd.Function.Name.Name.String() == INIT_MODULE_FN_NAME {
-				fl = fd.Function
-				break
+	for _, dec := range im.ast.Body {
+		if funDecl, ok := dec.(*ast.FunctionDeclaration); ok && funDecl.Function.Name.Name == INIT_MODULE_FN_NAME {
+			fl = funDecl.Function
+			break
+		} else if varStat, ok := dec.(*ast.VariableStatement); ok {
+			if id, ok := varStat.List[0].Target.(*ast.Identifier); ok && id.Name == INIT_MODULE_FN_NAME {
+				if fnLit, ok := varStat.List[0].Initializer.(*ast.FunctionLiteral); ok {
+					fl = fnLit
+				}
 			}
 		}
 	}
@@ -954,22 +950,22 @@ func (im *RuntimeJavascriptInitModule) getInitModuleFn() (*ast.BlockStatement, s
 	if fl == nil {
 		return nil, "", errors.New("failed to find InitModule function")
 	}
+	if len(fl.ParameterList.List) < 4 {
+		return nil, "", errors.New("InitModule function is missing params")
+	}
 
-	fBody := fl.Body.(*ast.BlockStatement)
-	initFnName := fl.ParameterList.List[3].Name.String() // Initializer is the 4th argument of InitModule
+	initFnName := fl.ParameterList.List[3].Target.(*ast.Identifier).Name.String() // Initializer is the 4th argument of InitModule
 
-	return fBody, initFnName, nil
+	return fl.Body, initFnName, nil
 }
 
 func (im *RuntimeJavascriptInitModule) getHookFnIdentifier(bs *ast.BlockStatement, initVarName, registerFnName string) (string, error) {
 	for _, exp := range bs.List {
 		if try, ok := exp.(*ast.TryStatement); ok {
-			if tryBs, ok := try.Body.(*ast.BlockStatement); ok {
-				if s, err := im.getHookFnIdentifier(tryBs, initVarName, registerFnName); err != nil {
-					continue
-				} else {
-					return s, nil
-				}
+			if s, err := im.getHookFnIdentifier(try.Body, initVarName, registerFnName); err != nil {
+				continue
+			} else {
+				return s, nil
 			}
 		}
 		if expStat, ok := exp.(*ast.ExpressionStatement); ok {
@@ -1073,12 +1069,10 @@ func (im *RuntimeJavascriptInitModule) extractRtHookFn(r *goja.Runtime, register
 func (im *RuntimeJavascriptInitModule) getRtHookFnIdentifier(r *goja.Runtime, bs *ast.BlockStatement, initVarName, registerFnName, rtFnName string) (string, error) {
 	for _, exp := range bs.List {
 		if try, ok := exp.(*ast.TryStatement); ok {
-			if tryBs, ok := try.Body.(*ast.BlockStatement); ok {
-				if s, err := im.getRtHookFnIdentifier(r, tryBs, initVarName, registerFnName, rtFnName); err != nil {
-					continue
-				} else {
-					return s, nil
-				}
+			if s, err := im.getRtHookFnIdentifier(r, try.Body, initVarName, registerFnName, rtFnName); err != nil {
+				continue
+			} else {
+				return s, nil
 			}
 		}
 		if expStat, ok := exp.(*ast.ExpressionStatement); ok {
@@ -1288,6 +1282,20 @@ func (im *RuntimeJavascriptInitModule) registerMatch(r *goja.Runtime) func(goja.
 		}
 		functions.terminateFn = fnKey
 
+		fnValue, ok = funcMap[string(MatchSignal)]
+		if !ok {
+			panic(r.NewTypeError(string(MatchSignal) + " not found"))
+		}
+		_, ok = goja.AssertFunction(r.ToValue(fnValue))
+		if !ok {
+			panic(r.NewTypeError(string(MatchSignal) + " value not a valid function"))
+		}
+		fnKey, err = im.extractMatchFnKey(r, name, MatchSignal)
+		if err != nil {
+			panic(r.NewGoError(err))
+		}
+		functions.signalFn = fnKey
+
 		im.MatchCallbacks.Add(name, functions)
 
 		return goja.Undefined()
@@ -1303,6 +1311,7 @@ const (
 	MatchLeave       MatchFnId = "matchLeave"
 	MatchLoop        MatchFnId = "matchLoop"
 	MatchTerminate   MatchFnId = "matchTerminate"
+	MatchSignal      MatchFnId = "matchSignal"
 )
 
 func (im *RuntimeJavascriptInitModule) extractMatchFnKey(r *goja.Runtime, modName string, matchFnId MatchFnId) (string, error) {
@@ -1322,12 +1331,10 @@ func (im *RuntimeJavascriptInitModule) extractMatchFnKey(r *goja.Runtime, modNam
 func (im *RuntimeJavascriptInitModule) getMatchHookFnIdentifier(r *goja.Runtime, bs *ast.BlockStatement, initFnVarName, modName string, matchfnId MatchFnId) (string, error) {
 	for _, exp := range bs.List {
 		if try, ok := exp.(*ast.TryStatement); ok {
-			if tryBs, ok := try.Body.(*ast.BlockStatement); ok {
-				if s, err := im.getMatchHookFnIdentifier(r, tryBs, initFnVarName, modName, matchfnId); err != nil {
-					continue
-				} else {
-					return s, nil
-				}
+			if s, err := im.getMatchHookFnIdentifier(r, try.Body, initFnVarName, modName, matchfnId); err != nil {
+				continue
+			} else {
+				return s, nil
 			}
 		}
 		if expStat, ok := exp.(*ast.ExpressionStatement); ok {
@@ -1345,17 +1352,33 @@ func (im *RuntimeJavascriptInitModule) getMatchHookFnIdentifier(r *goja.Runtime,
 							}
 						}
 
-						if obj, ok := callExp.ArgumentList[1].(*ast.ObjectLiteral); ok {
-							for _, prop := range obj.Value {
-								key, _ := prop.Key.(*ast.StringLiteral)
-								if key.Literal == string(matchfnId) {
-									if sl, ok := prop.Value.(*ast.StringLiteral); ok {
-										return sl.Literal, nil
-									} else if id, ok := prop.Value.(*ast.Identifier); ok {
-										return id.Name.String(), nil
-									} else {
-										return "", inlinedFunctionError
+						var obj *ast.ObjectLiteral
+						if matchHandlerId, ok := callExp.ArgumentList[1].(*ast.Identifier); ok {
+							// We know the obj is an identifier, we need to lookup it's definition in the AST
+							matchHandlerIdStr := matchHandlerId.Name.String()
+							for _, mhDec := range im.ast.DeclarationList {
+								if mhDecId, ok := mhDec.List[0].Target.(*ast.Identifier); ok && mhDecId.Name.String() == matchHandlerIdStr {
+									objLiteral, ok := mhDec.List[0].Initializer.(*ast.ObjectLiteral)
+									if ok {
+										obj = objLiteral
 									}
+								}
+								println(matchHandlerId)
+								println(mhDec)
+							}
+						} else {
+							obj, ok = callExp.ArgumentList[1].(*ast.ObjectLiteral)
+						}
+
+						for _, prop := range obj.Value {
+							key, _ := prop.(*ast.PropertyKeyed).Key.(*ast.StringLiteral)
+							if key.Literal == string(matchfnId) {
+								if sl, ok := prop.(*ast.PropertyKeyed).Value.(*ast.StringLiteral); ok {
+									return sl.Literal, nil
+								} else if id, ok := prop.(*ast.PropertyKeyed).Value.(*ast.Identifier); ok {
+									return id.Name.String(), nil
+								} else {
+									return "", inlinedFunctionError
 								}
 							}
 						}

@@ -20,16 +20,17 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/timestamp"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
-	"github.com/jackc/pgx/pgtype"
+	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
-	"time"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -39,6 +40,7 @@ const (
 	NotificationCodeGroupAdd         int32 = -4
 	NotificationCodeGroupJoinRequest int32 = -5
 	NotificationCodeFriendJoinGame   int32 = -6
+	NotificationCodeSingleSocket     int32 = -7
 )
 
 type notificationCacheableCursor struct {
@@ -82,6 +84,95 @@ func NotificationSend(ctx context.Context, logger *zap.Logger, db *sql.DB, messa
 	return nil
 }
 
+func NotificationSendAll(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, messageRouter MessageRouter, notification *api.Notification) error {
+	env := &rtapi.Envelope{
+		Message: &rtapi.Envelope_Notifications{
+			Notifications: &rtapi.Notifications{
+				Notifications: []*api.Notification{notification},
+			},
+		},
+	}
+
+	// Non-persistent notifications don't need to work through all database users, just use currently connected notification streams.
+	if !notification.Persistent {
+		notificationStreamMode := StreamModeNotifications
+		streams := tracker.CountByStreamModeFilter(map[uint8]*uint8{StreamModeNotifications: &notificationStreamMode})
+		for streamPtr, count := range streams {
+			if streamPtr == nil || count == 0 {
+				continue
+			}
+			messageRouter.SendToStream(logger, *streamPtr, env, true)
+		}
+		return nil
+	}
+
+	const limit = 10_000
+
+	// Start dispatch in paginated batches.
+	go func() {
+		// Switch to a background context, the caller should not wait for the full operation to complete.
+		ctx := context.Background()
+		notificationLogger := logger.With(zap.String("notification_subject", notification.Subject))
+
+		var userIDStr string
+		for {
+			sends := make(map[uuid.UUID][]*api.Notification, limit)
+
+			params := make([]interface{}, 0, 1)
+			query := "SELECT id FROM users"
+			if userIDStr != "" {
+				query += " AND id > $1"
+				params = append(params, userIDStr)
+			}
+			query += fmt.Sprintf(" ORDER BY id ASC LIMIT %d", limit)
+
+			rows, err := db.QueryContext(ctx, query, params...)
+			if err != nil {
+				notificationLogger.Error("Failed to retrieve user data to send notification", zap.Error(err))
+				return
+			}
+
+			for rows.Next() {
+				if err = rows.Scan(&userIDStr); err != nil {
+					_ = rows.Close()
+					notificationLogger.Error("Failed to scan user data to send notification", zap.String("id", userIDStr), zap.Error(err))
+					return
+				}
+				userID, err := uuid.FromString(userIDStr)
+				if err != nil {
+					_ = rows.Close()
+					notificationLogger.Error("Failed to parse scanned user id data to send notification", zap.String("id", userIDStr), zap.Error(err))
+					return
+				}
+				sends[userID] = []*api.Notification{notification}
+			}
+			_ = rows.Close()
+
+			if len(sends) == 0 {
+				// Pagination finished.
+				return
+			}
+
+			if err := NotificationSave(ctx, notificationLogger, db, sends); err != nil {
+				notificationLogger.Error("Failed to save persistent notifications", zap.Error(err))
+				return
+			}
+
+			// Deliver live notifications to connected users.
+			for userID, _ := range sends {
+				messageRouter.SendToStream(logger, PresenceStream{Mode: StreamModeNotifications, Subject: userID}, env, true)
+			}
+
+			// Stop pagination when reaching the last (incomplete) page.
+			if len(sends) < limit {
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
 func NotificationList(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, limit int, cursor string, nc *notificationCacheableCursor) (*api.NotificationList, error) {
 	params := []interface{}{userID}
 
@@ -111,7 +202,7 @@ ORDER BY create_time ASC, id ASC`+limitQuery, params...)
 	notifications := make([]*api.Notification, 0, limit)
 	var lastCreateTime int64
 	for rows.Next() {
-		no := &api.Notification{Persistent: true, CreateTime: &timestamp.Timestamp{}}
+		no := &api.Notification{Persistent: true, CreateTime: &timestamppb.Timestamp{}}
 		var createTime pgtype.Timestamptz
 		if err := rows.Scan(&no.Id, &no.Subject, &no.Content, &no.Code, &no.SenderId, &createTime); err != nil {
 			_ = rows.Close()

@@ -39,9 +39,8 @@ ones) is treated as an index and passed to the trap methods of the DynamicArray.
 the regular ECMAScript arrays which only support positive indexes up to 2^32-1.
 
 DynamicArray cannot be sparse, i.e. hasOwnProperty(num) will return true for num >= 0 && num < Len(). Deleting
-such a property will fail. Note that this creates a slight peculiarity because the properties are reported as
-configurable (and therefore should be deletable). Reporting them as non-configurable is not an option though
-as it breaks an ECMAScript invariant where non-configurable properties cannot disappear.
+such a property is equivalent to setting it to undefined. Note that this creates a slight peculiarity because
+hasOwnProperty() will still return true, even after deletion.
 
 Note that Runtime.ToValue() does not have any special treatment for DynamicArray. The only way to create
 a dynamic array is by using the Runtime.NewDynamicArray() method. This is done deliberately to avoid
@@ -452,18 +451,28 @@ func (i *dynamicObjectPropIter) next() (propIterItem, iterNextFunc) {
 		name := i.propNames[i.idx]
 		i.idx++
 		if i.o.d.Has(name) {
-			return propIterItem{name: unistring.NewFromString(name), enumerable: _ENUM_TRUE}, i.next
+			return propIterItem{name: newStringValue(name), enumerable: _ENUM_TRUE}, i.next
 		}
 	}
 	return propIterItem{}, nil
 }
 
-func (o *dynamicObject) enumerateOwnKeys() iterNextFunc {
+func (o *dynamicObject) iterateStringKeys() iterNextFunc {
 	keys := o.d.Keys()
 	return (&dynamicObjectPropIter{
 		o:         o,
 		propNames: keys,
 	}).next
+}
+
+func (o *baseDynamicObject) iterateSymbols() iterNextFunc {
+	return func() (propIterItem, iterNextFunc) {
+		return propIterItem{}, nil
+	}
+}
+
+func (o *dynamicObject) iterateKeys() iterNextFunc {
+	return o.iterateStringKeys()
 }
 
 func (o *dynamicObject) export(ctx *objectExportCtx) interface{} {
@@ -474,6 +483,14 @@ func (o *dynamicObject) exportType() reflect.Type {
 	return reflect.TypeOf(o.d)
 }
 
+func (o *baseDynamicObject) exportToMap(dst reflect.Value, typ reflect.Type, ctx *objectExportCtx) error {
+	return genericExportToMap(o.val, dst, typ, ctx)
+}
+
+func (o *baseDynamicObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, ctx *objectExportCtx) error {
+	return genericExportToArrayOrSlice(o.val, dst, typ, ctx)
+}
+
 func (o *dynamicObject) equal(impl objectImpl) bool {
 	if other, ok := impl.(*dynamicObject); ok {
 		return o.d == other.d
@@ -481,7 +498,7 @@ func (o *dynamicObject) equal(impl objectImpl) bool {
 	return false
 }
 
-func (o *dynamicObject) ownKeys(all bool, accum []Value) []Value {
+func (o *dynamicObject) stringKeys(all bool, accum []Value) []Value {
 	keys := o.d.Keys()
 	if l := len(accum) + len(keys); l > cap(accum) {
 		oldAccum := accum
@@ -494,12 +511,12 @@ func (o *dynamicObject) ownKeys(all bool, accum []Value) []Value {
 	return accum
 }
 
-func (*baseDynamicObject) ownSymbols(all bool, accum []Value) []Value {
+func (*baseDynamicObject) symbols(all bool, accum []Value) []Value {
 	return accum
 }
 
-func (o *dynamicObject) ownPropertyKeys(all bool, accum []Value) []Value {
-	return o.ownKeys(all, accum)
+func (o *dynamicObject) keys(all bool, accum []Value) []Value {
+	return o.stringKeys(all, accum)
 }
 
 func (*baseDynamicObject) _putProp(name unistring.String, value Value, writable, enumerable, configurable bool) Value {
@@ -532,7 +549,7 @@ func (a *dynamicArray) getStr(p unistring.String, receiver Value) Value {
 	if p == "length" {
 		return intToValue(int64(a.a.Len()))
 	}
-	if idx, ok := strPropToInt(p); ok {
+	if idx, ok := strToInt(p); ok {
 		return a.a.Get(idx)
 	}
 	return a.getParentStr(p, receiver)
@@ -552,7 +569,7 @@ func (a *dynamicArray) getOwnPropStr(u unistring.String) Value {
 			writable: true,
 		}
 	}
-	if idx, ok := strPropToInt(u); ok {
+	if idx, ok := strToInt(u); ok {
 		return a.a.Get(idx)
 	}
 	return nil
@@ -574,7 +591,7 @@ func (a *dynamicArray) setOwnStr(p unistring.String, v Value, throw bool) bool {
 	if p == "length" {
 		return a._setLen(v, throw)
 	}
-	if idx, ok := strPropToInt(p); ok {
+	if idx, ok := strToInt(p); ok {
 		return a._setIdx(idx, v, throw)
 	}
 	a.val.runtime.typeErrorResult(throw, "Cannot set property %q on a dynamic array", p.String())
@@ -629,7 +646,7 @@ func (a *dynamicArray) hasOwnPropertyStr(u unistring.String) bool {
 	if u == "length" {
 		return true
 	}
-	if idx, ok := strPropToInt(u); ok {
+	if idx, ok := strToInt(u); ok {
 		return a._has(idx)
 	}
 	return false
@@ -641,7 +658,7 @@ func (a *dynamicArray) hasOwnPropertyIdx(v valueInt) bool {
 
 func (a *dynamicArray) defineOwnPropertyStr(name unistring.String, desc PropertyDescriptor, throw bool) bool {
 	if a.checkDynamicObjectPropertyDescr(name, desc, throw) {
-		if idx, ok := strPropToInt(name); ok {
+		if idx, ok := strToInt(name); ok {
 			return a._setIdx(idx, desc.Value, throw)
 		}
 		a.val.runtime.typeErrorResult(throw, "Cannot define property %q on a dynamic array", name.String())
@@ -657,15 +674,14 @@ func (a *dynamicArray) defineOwnPropertyIdx(name valueInt, desc PropertyDescript
 }
 
 func (a *dynamicArray) _delete(idx int, throw bool) bool {
-	if !a._has(idx) {
-		return true
+	if a._has(idx) {
+		a._setIdx(idx, _undefined, throw)
 	}
-	a.val.runtime.typeErrorResult(throw, "Cannot delete index property %d from a dynamic array", idx)
-	return false
+	return true
 }
 
 func (a *dynamicArray) deleteStr(name unistring.String, throw bool) bool {
-	if idx, ok := strPropToInt(name); ok {
+	if idx, ok := strToInt(name); ok {
 		return a._delete(idx, throw)
 	}
 	if a.hasOwnPropertyStr(name) {
@@ -688,17 +704,21 @@ func (i *dynArrayPropIter) next() (propIterItem, iterNextFunc) {
 	if i.idx < i.limit && i.idx < i.a.Len() {
 		name := strconv.Itoa(i.idx)
 		i.idx++
-		return propIterItem{name: unistring.String(name), enumerable: _ENUM_TRUE}, i.next
+		return propIterItem{name: asciiString(name), enumerable: _ENUM_TRUE}, i.next
 	}
 
 	return propIterItem{}, nil
 }
 
-func (a *dynamicArray) enumerateOwnKeys() iterNextFunc {
+func (a *dynamicArray) iterateStringKeys() iterNextFunc {
 	return (&dynArrayPropIter{
 		a:     a.a,
 		limit: a.a.Len(),
 	}).next
+}
+
+func (a *dynamicArray) iterateKeys() iterNextFunc {
+	return a.iterateStringKeys()
 }
 
 func (a *dynamicArray) export(ctx *objectExportCtx) interface{} {
@@ -716,7 +736,7 @@ func (a *dynamicArray) equal(impl objectImpl) bool {
 	return false
 }
 
-func (a *dynamicArray) ownKeys(all bool, accum []Value) []Value {
+func (a *dynamicArray) stringKeys(all bool, accum []Value) []Value {
 	al := a.a.Len()
 	l := len(accum) + al
 	if all {
@@ -736,6 +756,6 @@ func (a *dynamicArray) ownKeys(all bool, accum []Value) []Value {
 	return accum
 }
 
-func (a *dynamicArray) ownPropertyKeys(all bool, accum []Value) []Value {
-	return a.ownKeys(all, accum)
+func (a *dynamicArray) keys(all bool, accum []Value) []Value {
+	return a.stringKeys(all, accum)
 }
